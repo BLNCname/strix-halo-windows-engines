@@ -26,7 +26,15 @@ The script fetches the pinned upstream commit, applies the mixed-format patch an
 
 The [runtime manager](https://github.com/BLNCname/strix-halo-runtime-manager) installs the release bundle by URL and fetches the matching runtime dependencies from their publishers. The engine package contains the native executable, profile manifest and license notices. Model shards stay where you downloaded them.
 
-The project additions and Gufo are MIT licensed. Gufo's notices cover its incorporated components, including ggml (MIT) and Rust crates. Its unmodified Symphonia crates use MPL-2.0. Their exact versions and checksums are recorded in [the upstream Cargo.lock](https://github.com/gufo-org/gufo/blob/v0.35.0/Cargo.lock), and sources are available from [crates.io](https://crates.io/crates/symphonia). Full third-party texts accompany the release. Peonist publishes the HaloGen container under its [own EULA](https://github.com/peonist-ai/halogen-flash-server/blob/main/LICENSE.md). This build contains no HaloGen executable or source.
+The project additions and Gufo are MIT licensed. Gufo's notices cover its incorporated components, including ggml (MIT) and Rust crates. Its unmodified Symphonia crates use MPL-2.0. Their exact versions and checksums are recorded in [the upstream Cargo.lock](https://github.com/gufo-org/gufo/blob/v0.35.0/Cargo.lock), and sources are available from [crates.io](https://crates.io/crates/symphonia). Full third-party texts accompany the release. Peonist publishes the HaloGen container under its [own EULA](https://github.com/peonist-ai/halogen-flash-server/blob/main/LICENSE.md).
+
+## Measured on Radeon 8060S
+
+With Q3_K_XL, an external Q8_0 MTP head, a single active request and a 262144-token window, a cold C++ retrieval prompt used **262067 actual input tokens at 865.0 prefill tokens/s**. The 27-token answer recovered three independently generated markers. Gufo measured 43.9 decode tokens/s and accepted 22 of 31 MTP proposals on this short answer.
+
+In a separate Hermes tool-and-reasoning test, the model used `read_file` and solved a grid-counting problem with an independently checked answer. Across two requests Hermes counted 15457 reasoning tokens. The longer request had 4461 prompt tokens (4200 cached), generated **15442 tokens at 37.1 tokens/s**, and accepted 11758 of 20470 MTP proposals. The long decode and the long prefill were measured in separate requests.
+
+For Q3_K_XL and IQ4_XS, release-library GPU projections were compared with independent ggml CPU dequantization on real shard rows, with both one and 64 input tokens. The largest Q3 relative L2 error was 0.000041. Q2_0 expansion matched all 10240 sampled reference values.
 
 ## Check the kernels and package
 
