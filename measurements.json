@@ -1,0 +1,242 @@
+{
+  "hardware": "Radeon 8060S (gfx1151), 128 GiB UMA, Windows 11",
+  "weights": "Unsloth Qwen3.8-Flash-Next UD-Q3_K_XL, four original GGUF shards",
+  "head": "external Q8_0 MTP",
+  "context": 262144,
+  "cold_prefill": [
+    {
+      "engine": "1.0.0",
+      "target_and_draft_kv": "f16",
+      "sessions": 1,
+      "input_tokens": 262067,
+      "cached_tokens": 0,
+      "output_tokens": 27,
+      "prefill_tps": 865.0,
+      "decode_tps_lms": 43.87,
+      "retrieved": true,
+      "body_text_target": 262000,
+      "seed": 43623,
+      "ttft_s_lms": 302.973
+    },
+    {
+      "engine": "1.1.0",
+      "target_and_draft_kv": "q8_0",
+      "sessions": 1,
+      "input_tokens": 262067,
+      "cached_tokens": 0,
+      "output_tokens": 29,
+      "prefill_tps": 851.5,
+      "decode_tps_lms": 54.94,
+      "retrieved": true,
+      "body_text_target": 262000,
+      "seed": 90211,
+      "ttft_s_lms": 307.782
+    },
+    {
+      "engine": "1.1.0",
+      "target_and_draft_kv": "q8_0",
+      "sessions": 1,
+      "input_tokens": 262084,
+      "cached_tokens": 0,
+      "output_tokens": 39,
+      "prefill_tps": 881.9,
+      "decode_tps_lms": 45.2,
+      "retrieved": true,
+      "body_text_target": 262000,
+      "seed": 73417,
+      "ttft_s_lms": 297.192
+    },
+    {
+      "engine": "1.2.0",
+      "target_and_draft_kv": "q8_0",
+      "sessions": 4,
+      "shared_context": true,
+      "logical_batch": 2048,
+      "physical_batch": 512,
+      "input_tokens": 261998,
+      "cached_tokens": 0,
+      "output_tokens": 40,
+      "prefill_tps": 561.2224027915538,
+      "decode_tps_gufo": 48.39406122598852,
+      "retrieved": true,
+      "draft_proposed": 34,
+      "draft_accepted": 31,
+      "body_text_target": 262000,
+      "seed": 73331
+    }
+  ],
+  "hermes": [
+    {
+      "engine": "1.0.0",
+      "task": "grid",
+      "target_and_draft_kv": "f16",
+      "tool_names": [
+        "read_file"
+      ],
+      "tool_ids_match": true,
+      "reasoning_tokens": 15457,
+      "correct_final_result": true,
+      "strict_single_value_response": true,
+      "requests": [
+        {
+          "prompt_tokens": 4207,
+          "generated_tokens": 70,
+          "prefill_tokens": 2159,
+          "cached_tokens": 2048,
+          "prefill_tps": 787.3,
+          "decode_tps": 40.2
+        },
+        {
+          "prompt_tokens": 4461,
+          "generated_tokens": 15442,
+          "prefill_tokens": 261,
+          "cached_tokens": 4200,
+          "prefill_tps": 474.6,
+          "decode_tps": 37.1
+        }
+      ]
+    },
+    {
+      "engine": "1.2.0",
+      "task": "six congruences",
+      "target_and_draft_kv": "q8_0",
+      "tool_names": [
+        "read_file"
+      ],
+      "tool_ids_match": true,
+      "reasoning_tokens": 2234,
+      "correct_final_result": true,
+      "strict_single_value_response": false,
+      "requests": [
+        {
+          "prompt_tokens": 4201,
+          "generated_tokens": 56,
+          "prefill_tokens": 2153,
+          "cached_tokens": 2048,
+          "prefill_tps": 610.4,
+          "decode_tps": 39.2
+        },
+        {
+          "prompt_tokens": 4387,
+          "generated_tokens": 2997,
+          "prefill_tokens": 191,
+          "cached_tokens": 4196,
+          "prefill_tps": 431.3,
+          "decode_tps": 43.6
+        }
+      ]
+    }
+  ],
+  "additional_runs": [
+    {
+      "engine": "1.1.0",
+      "workload": "Hermes grid retry",
+      "result": "cancelled at test timeout",
+      "generated_tokens": 25035
+    },
+    {
+      "engine": "1.2.0",
+      "workload": "smaller grid",
+      "result": "incorrect exact answer",
+      "reasoning_tokens": 818
+    }
+  ],
+  "memory_loads": [
+    {
+      "engine": "1.0.0",
+      "quant": "Q3",
+      "sessions": 1,
+      "kv": "f16",
+      "shared_context": false,
+      "system_commit_before_gib": 21.85,
+      "peak_system_commit_gib": 101.66,
+      "peak_system_pagefile_used_gib": 1.33,
+      "peak_wddm_dedicated_gib": 62.4,
+      "peak_wddm_shared_gib": 15.95
+    },
+    {
+      "engine": "1.0.0",
+      "quant": "Q3",
+      "sessions": 4,
+      "kv": "f16",
+      "shared_context": false,
+      "system_commit_before_gib": 22.41,
+      "peak_system_commit_gib": 122.33,
+      "peak_system_pagefile_used_gib": 1.32,
+      "peak_wddm_dedicated_gib": 62.44,
+      "peak_wddm_shared_gib": 36.6
+    },
+    {
+      "engine": "1.1.0",
+      "quant": "Q3",
+      "sessions": 1,
+      "kv": "q8_0",
+      "shared_context": false,
+      "system_commit_before_gib": 21.67,
+      "peak_system_commit_gib": 98.86,
+      "peak_system_pagefile_used_gib": 1.34,
+      "peak_wddm_dedicated_gib": 62.65,
+      "peak_wddm_shared_gib": 13.14
+    },
+    {
+      "engine": "1.1.0",
+      "quant": "Q3",
+      "sessions": 4,
+      "kv": "q8_0",
+      "shared_context": false,
+      "system_commit_before_gib": 21.71,
+      "peak_system_commit_gib": 110.57,
+      "peak_system_pagefile_used_gib": 1.34,
+      "peak_wddm_dedicated_gib": 62.63,
+      "peak_wddm_shared_gib": 24.76
+    },
+    {
+      "engine": "1.1.0",
+      "quant": "Q4",
+      "sessions": 4,
+      "kv": "q8_0",
+      "shared_context": false,
+      "system_commit_before_gib": 21.54,
+      "peak_system_commit_gib": 123.74,
+      "peak_system_pagefile_used_gib": 1.33,
+      "peak_wddm_dedicated_gib": 61.9,
+      "peak_wddm_shared_gib": 38.61
+    },
+    {
+      "engine": "1.1.0",
+      "quant": "IQ4",
+      "sessions": 4,
+      "kv": "q8_0",
+      "shared_context": false,
+      "system_commit_before_gib": 21.67,
+      "peak_system_commit_gib": 114.41,
+      "peak_system_pagefile_used_gib": 1.34,
+      "peak_wddm_dedicated_gib": 62.52,
+      "peak_wddm_shared_gib": 28.76
+    },
+    {
+      "engine": "1.2.0",
+      "quant": "Q3",
+      "sessions": 4,
+      "kv": "q8_0",
+      "shared_context": true,
+      "system_commit_before_gib": 28.38,
+      "peak_system_commit_gib": 99.37,
+      "peak_system_pagefile_used_gib": 1.33,
+      "peak_wddm_dedicated_gib": 62.58,
+      "peak_wddm_shared_gib": 9.83
+    },
+    {
+      "engine": "1.2.0",
+      "quant": "Q4",
+      "sessions": 4,
+      "kv": "q8_0",
+      "shared_context": true,
+      "system_commit_before_gib": 25.7,
+      "peak_system_commit_gib": 115.02,
+      "peak_system_pagefile_used_gib": 1.33,
+      "peak_wddm_dedicated_gib": 62.27,
+      "peak_wddm_shared_gib": 23.93
+    }
+  ]
+}

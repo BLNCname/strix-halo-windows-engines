@@ -1,0 +1,1450 @@
+diff --git a/src/cli/main.cpp b/src/cli/main.cpp
+index 27d4d71..91cd5a9 100644
+--- a/src/cli/main.cpp
++++ b/src/cli/main.cpp
+@@ -16,6 +16,7 @@
+ #include "src/cli/prompt/prompt.hpp"
+ #include "src/cli/serve/serve.hpp"
+ #include "src/cli/speak/speak.hpp"
++#include "src/cli/studio_launch.hpp"
+ #include "src/cli/transcribe/transcribe.hpp"
+ #include "src/cli/video/video.hpp"
+ 
+@@ -211,7 +212,16 @@ int main(int argc, char* argv[]) {
+   // `--model <id>` names an installed model; commands receive its path.
+   std::vector<std::string> resolved;
+   try {
+-    resolved = gufo::cli::ResolveModelArguments(raw);
++    if (raw.size() >= 3 && std::string_view(raw[1]) == "serve" &&
++        std::string_view(raw[2]) == "lmstudio") {
++      const auto translated = gufo::cli::StudioArguments(raw);
++      std::vector<const char*> native;
++      for (const auto& arg : translated)
++        native.push_back(arg.c_str());
++      resolved = gufo::cli::ResolveModelArguments(native);
++    } else {
++      resolved = gufo::cli::ResolveModelArguments(raw);
++    }
+   } catch (const std::exception& error) {
+     std::cerr << "Error: " << error.what() << "\n";
+     return 1;
+diff --git a/src/cli/serve/component_text_cache.cpp b/src/cli/serve/component_text_cache.cpp
+index d9b78fa..8561e38 100644
+--- a/src/cli/serve/component_text_cache.cpp
++++ b/src/cli/serve/component_text_cache.cpp
+@@ -19,6 +19,7 @@
+ #include "src/cli/serve/text_model_runner.hpp"
+ #include "src/core/crypto/sha256.hpp"
+ #include "src/core/platform/os_info.hpp"
++#include "src/core/studio_load.hpp"
+ 
+ namespace gufo::server {
+ namespace {
+@@ -292,7 +293,10 @@ struct ComponentTextCache::Impl {
+             ledger, ram, count)),
+         identity(resources->adapter->CompatibilityIdentity()),
+         index(ledger),
+-        retention(ledger, index, &events),
++        retention(ledger, index, &events,
++                  studio::Load().checkpoints > 0
++                      ? static_cast<size_t>(studio::Load().checkpoints)
++                      : cache::RetentionPolicy::kRecordLimit),
+         ram_enabled(ram_on) {
+     metadata = ledger.Reserve(cache::ResourceCategory::kMetadata, sizeof(Impl))
+                    .Convert();
+@@ -2333,6 +2337,7 @@ std::size_t ComponentTextCache::Lease::Commit(
+   if (capture_frontier) {
+     const std::lock_guard lock(impl_->cache->mutex);
+     async_frontier =
++        !studio::Load().shared_context &&
+         std::ranges::none_of(impl_->cache->entries, [&](const auto& e) {
+           return e.get() != impl_->entry && (e->busy || e->frontier_active);
+         });
+@@ -2356,6 +2361,12 @@ std::size_t ComponentTextCache::Lease::Commit(
+           std::string("event=frontier_capture_refused reason=") + error.what());
+     }
+   }
++  if (studio::Load().shared_context) {
++    // Keep admitted RAM/disk checkpoints. Return live HIP rows to the shared
++    // pool so an idle slot cannot prevent a different chat using the window.
++    Invalidate();
++    return bytes;
++  }
+   auto positions =
+       impl_->cache->resources->adapter->Positions(impl_->slot.Execution());
+   const auto location = impl_->slot.Location();
+diff --git a/src/cli/serve/http_server.cpp b/src/cli/serve/http_server.cpp
+index f8f9441..84f71dc 100644
+--- a/src/cli/serve/http_server.cpp
++++ b/src/cli/serve/http_server.cpp
+@@ -51,6 +51,7 @@
+ #include "src/core/platform/net.hpp"
+ #include "src/core/platform/shutdown_signal.hpp"
+ #include "src/core/rust/callback.hpp"
++#include "src/core/studio_load.hpp"
+ #include "src/core/utf8.hpp"
+ #include "src/families/qwen/text/chat_template.hpp"
+ 
+@@ -1502,6 +1503,40 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
+     resp["total_slots"] = sessions;
+   }
+ 
++  if (const auto& load = studio::Load(); load.active) {
++    json::Value settings = json::Value::object();
++    settings["shared_context_tokens"] =
++        static_cast<long long>(load.shared_context);
++    settings["used_shared_rows"] =
++        static_cast<long long>(studio::Usage().rows.load());
++    settings["peak_shared_rows"] =
++        static_cast<long long>(studio::Usage().peak_rows.load());
++    settings["mapped_kv_bytes"] =
++        static_cast<long long>(studio::Usage().mapped_bytes.load());
++    settings["batch_size"] = static_cast<long long>(load.batch);
++    settings["ubatch_size"] = static_cast<long long>(load.ubatch);
++    settings["flash_attention"] = load.flash_attention;
++    settings["threads"] = static_cast<long long>(load.threads);
++    settings["batch_threads"] = static_cast<long long>(load.batch_threads);
++    settings["checkpoints"] = load.checkpoints;
++    settings["draft_max"] = static_cast<long long>(load.draft_max);
++    settings["draft_min"] = static_cast<long long>(load.draft_min);
++    settings["draft_p_min"] = static_cast<double>(load.draft_probability);
++    settings["load_mode"] = load.memory_mode;
++    settings["lazy_mode"] = load.lazy_mode;
++    settings["key_cache"] = load.key_cache;
++    settings["value_cache"] = load.value_cache;
++    settings["draft_key_cache"] = load.draft_key_cache;
++    settings["draft_value_cache"] = load.draft_value_cache;
++    settings["rope_base_override"] = static_cast<double>(load.rope_base);
++    settings["rope_scale_override"] = static_cast<double>(load.rope_scale);
++    settings["validated_template_file"] = !load.chat_template.empty();
++    json::Value keys = json::Value::array();
++    for (const auto& name : load.option_names)
++      keys.push_back(name);
++    settings["received_options"] = std::move(keys);
++    resp["studio_load"] = std::move(settings);
++  }
+   // What a request without sampling fields gets.
+   const auto defaults = b.sampling_defaults();
+   const auto sampling = defaults.Resolve(b.reasoning_defaults().enabled);
+diff --git a/src/cli/serve/text_generation_scheduler.cpp b/src/cli/serve/text_generation_scheduler.cpp
+index 8700ea4..c1963b4 100644
+--- a/src/cli/serve/text_generation_scheduler.cpp
++++ b/src/cli/serve/text_generation_scheduler.cpp
+@@ -27,6 +27,7 @@
+ #include "src/cli/serve/logging.hpp"
+ #include "src/cli/serve/stop_sequences.hpp"
+ #include "src/cli/serve/trace.hpp"
++#include "src/core/studio_load.hpp"
+ #include "src/sched/policy.hpp"
+ 
+ namespace gufo::server {
+@@ -2553,9 +2554,12 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
+       admission_claim.prompt_admission_budget_bytes.has_value()) {
+     const auto per_token = *admission_claim.prompt_state_bytes_per_token;
+     if (per_token != 0) {
+-      if (prompt_tokens > std::numeric_limits<std::size_t>::max() / per_token)
++      const bool bounded = studio::Load().shared_context && max_tokens > 0 &&
++                           max_tokens < available;
++      const auto charged_tokens = prompt_tokens + (bounded ? max_tokens : 0);
++      if (charged_tokens > std::numeric_limits<std::size_t>::max() / per_token)
+         throw std::length_error("prompt state byte claim overflows");
+-      prompt_state_bytes = prompt_tokens * per_token;
++      prompt_state_bytes = charged_tokens * per_token;
+       prompt_budget_bytes = *admission_claim.prompt_admission_budget_bytes;
+     }
+   }
+@@ -2707,6 +2711,13 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
+                           std::to_string(*prompt_state_bytes) +
+                           " host bytes but only " +
+                           std::to_string(*refusal_remaining_bytes) + " remain";
++        if (studio::Load().shared_context) {
++          const auto stride = *admission_claim.prompt_state_bytes_per_token;
++          refusal_message =
++              "shared KV context needs " +
++              std::to_string(*prompt_state_bytes / stride) + " token rows; " +
++              std::to_string(*refusal_remaining_bytes / stride) + " available";
++        }
+         refusal_reason = "insufficient_memory";
+         refusal_required_bytes = *prompt_state_bytes;
+         decision_queued = impl_->queued_count;
+diff --git a/src/cli/studio_launch.hpp b/src/cli/studio_launch.hpp
+new file mode 100644
+index 0000000..3121da0
+--- /dev/null
++++ b/src/cli/studio_launch.hpp
+@@ -0,0 +1,278 @@
++#pragma once
++
++#include <algorithm>
++#include <charconv>
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <limits>
++#include <span>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "src/core/platform/env.hpp"
++#include "src/core/studio_load.hpp"
++
++namespace gufo::cli {
++// Receives the model-launch argv emitted by the host, including one-off
++// overrides. Transport credentials terminate in the local API bridge, before
++// this entry point.
++inline std::vector<std::string> StudioArguments(
++    std::span<const char* const> input) {
++  if (input.size() < 7 || std::string_view(input[5]) != "--")
++    throw std::invalid_argument(
++        "usage: gufo serve lmstudio WORKER_PORT ALIAS -- MODEL_OPTIONS...");
++  using S = std::string;
++  auto number = [](const S& value, const S& key, int lo, int hi) {
++    int n{};
++    const auto [stop, err] =
++        std::from_chars(value.data(), value.data() + value.size(), n);
++    if (err != std::errc{} || stop != value.data() + value.size() || n < lo ||
++        n > hi)
++      throw std::invalid_argument("out of range or invalid integer for " + key);
++    return n;
++  };
++  auto real = [](const S& value, const S& key, float lo, float hi) {
++    std::size_t end = 0;
++    const float n = std::stof(value, &end);
++    if (end != value.size() || !std::isfinite(n) || n < lo || n > hi)
++      throw std::invalid_argument("out of range or invalid number for " + key);
++    return n;
++  };
++  auto unsupported = [](const S& key, const S& reason) {
++    throw std::invalid_argument(key + ": " + reason);
++  };
++  number(input[3], "worker port", 1, 65535);
++  auto& cfg = studio::Load();
++  cfg.active = true;
++  std::vector<S> out{
++      input[0],    "serve",         "llm",    "--host",
++      "127.0.0.1", "--port",        input[3], "--served-model-name",
++      input[4],    "--log-progress"};
++  std::vector<S> received;
++  bool unified = false, have_model = false;
++  unsigned total = 0, sessions = 1, per_slot = 0;
++  S mode, draft, ktype = "f16", vtype = "f16", draft_k, draft_v;
++  S ram_cache;
++  for (std::size_t i = 6; i < input.size(); ++i) {
++    S raw(input[i]);
++    const auto eq = raw.find('=');
++    S key = raw.substr(0, eq);
++    auto take = [&]() -> S {
++      if (eq != S::npos)
++        return raw.substr(eq + 1);
++      if (++i == input.size() || std::string_view(input[i]).starts_with("--"))
++        throw std::invalid_argument("missing value for " + key);
++      return input[i];
++    };
++    auto integer = [&](int lo, int hi) { return number(take(), key, lo, hi); };
++    auto decimal = [&](float lo, float hi) {
++      return real(take(), key, lo, hi);
++    };
++    if (key.starts_with("-"))
++      received.push_back(key);
++    if (key == "--ctx-size" || key == "-c")
++      total = integer(0, 16777216);
++    else if (key == "--parallel" || key == "-np")
++      sessions = integer(1, 64);
++    else if (key == "--kv-unified" || key == "-kvu")
++      unified = true;
++    else if (key == "--no-kv-unified" || key == "-no-kvu")
++      unified = false;
++    else if (key == "--kv-unified-per-slot")
++      per_slot = integer(1, 16777216);
++    else if (key == "--model" || key == "-m") {
++      out.insert(out.end(), {"--model", take()});
++      have_model = true;
++    } else if (key == "--host" || key == "--port")
++      (void)take();
++    else if (key == "--alias" || key == "-a") {
++      const S aliases = take();
++      for (size_t begin = 0; begin < aliases.size();) {
++        const auto end = aliases.find(',', begin);
++        auto alias = aliases.substr(begin, end == S::npos ? end : end - begin);
++        if (!alias.empty() && alias != input[4])
++          out.insert(out.end(), {"--served-model-name", alias});
++        if (end == S::npos)
++          break;
++        begin = end + 1;
++      }
++    } else if (key == "--no-webui" || key == "--jinja" ||
++               key == "--kv-offload" || key == "--op-offload" ||
++               key == "--mmproj-offload" ||
++               key == "--cont-batching") { /* native service topology */
++    } else if (key == "--gpu-layers" || key == "--n-gpu-layers" ||
++               key == "-ngl") {
++      const auto value = take();
++      if (value != "all" && value != "auto" && value != "-1" &&
++          number(value, key, 0, 2147483647) < 48)
++        unsupported(key, "Flash-Next requires all 48 trunk layers on the GPU");
++    } else if (key == "--n-cpu-moe" || key == "--n-cpu-moe-draft") {
++      if (integer(0, 2147483647) != 0)
++        unsupported(
++            key,
++            "CPU expert offload is unavailable on this native ROCm worker");
++    } else if (key == "--main-gpu" || key == "-mg") {
++      if (integer(0, 64) != 0)
++        unsupported(key, "the Strix Halo worker uses device 0");
++    } else if (key == "--tensor-split" || key == "-ts") {
++      const auto v = take();
++      if (v.find_first_of(",/") != S::npos)
++        unsupported(key, "multiple devices are unavailable");
++      (void)real(v, key, 0, std::numeric_limits<float>::max());
++    } else if (key == "--split-mode" || key == "-sm") {
++      const auto v = take();
++      if (v != "layer" && v != "none")
++        unsupported(key, "only a single Strix Halo GPU is available");
++    } else if (key == "--no-kv-offload")
++      unsupported(key, "this worker keeps the attention cache on the GPU");
++    else if (key == "--threads" || key == "-t" || key == "--threads-batch" ||
++             key == "-tb") {
++      const int n = integer(-1, 1024);
++      if (n > 0) {
++        if (key == "--threads-batch" || key == "-tb")
++          cfg.batch_threads = n;
++        else
++          cfg.threads = n;
++      }
++    } else if (key == "--batch-size" || key == "-b")
++      cfg.batch = integer(1, 1048576);
++    else if (key == "--ubatch-size" || key == "-ub")
++      cfg.ubatch = integer(1, 1048576);
++    else if (key == "--ctx-checkpoints")
++      cfg.checkpoints = integer(0, 128);
++    else if (key == "--flash-attn" || key == "-fa") {
++      const auto v = take();
++      if (v != "on" && v != "auto" && v != "off")
++        unsupported(key, "expected on, off or auto");
++      cfg.flash_attention = v != "off";
++    } else if (key == "--cache-type-k" || key == "-ctk")
++      ktype = take();
++    else if (key == "--cache-type-v" || key == "-ctv")
++      vtype = take();
++    else if (key == "--spec-draft-type-k" || key == "--cache-type-k-draft" ||
++             key == "-ctkd")
++      draft_k = take();
++    else if (key == "--spec-draft-type-v" || key == "--cache-type-v-draft" ||
++             key == "-ctvd")
++      draft_v = take();
++    else if (key == "--spec-type")
++      mode = take();
++    else if (key == "--spec-draft-model" || key == "--model-draft" ||
++             key == "-md")
++      draft = take();
++    else if (key == "--spec-draft-n-max" || key == "--draft-max")
++      cfg.draft_max = integer(1, 7);
++    else if (key == "--spec-draft-n-min" || key == "--draft-min")
++      cfg.draft_min = integer(0, 7);
++    else if (key == "--spec-draft-p-min" || key == "--draft-p-min")
++      cfg.draft_probability = decimal(0, 1);
++    else if (key == "--chat-template-file")
++      cfg.chat_template = take();
++    else if (key == "--load-mode")
++      cfg.memory_mode = take();
++    else if (key == "--mmap")
++      cfg.memory_mode = "mmap";
++    else if (key == "--no-mmap")
++      cfg.memory_mode = "none";
++    else if (key == "--mlock")
++      cfg.memory_mode = "mlock";
++    else if (key == "--lazy-mode") {
++      const auto v = take();
++      if (v != "auto" && v != "off" && v != "on")
++        unsupported(key, "expected auto, on or off");
++      cfg.lazy_mode = v;
++    } else if (key == "--rope-freq-base")
++      cfg.rope_base = decimal(0, std::numeric_limits<float>::max());
++    else if (key == "--rope-freq-scale")
++      cfg.rope_scale = decimal(0, std::numeric_limits<float>::max());
++    else if (key == "--verbosity") {
++      const int v = integer(0, 9);
++      out.insert(out.end(), {"--log-level", v == 0   ? "error"
++                                            : v == 1 ? "warn"
++                                            : v >= 4 ? "debug"
++                                                     : "info"});
++    } else if (key == "--cache-ram-bytes")
++      ram_cache = take();
++    else if (key == "--reasoning" || key == "-rea")
++      out.insert(out.end(), {"--think", take()});
++    else if (key == "--temp")
++      out.insert(out.end(), {"--temperature", take()});
++    else if (key == "--api-key" || key == "--api-key-file")
++      unsupported(key, "transport authentication belongs to the host bridge");
++    else
++      out.push_back(raw);  // The native CLI accepts its own options or names an
++                           // unsupported one.
++  }
++  cfg.option_names = received;
++  cfg.sessions = sessions;
++  cfg.key_cache = ktype;
++  cfg.value_cache = vtype;
++  cfg.draft_key_cache = draft_k.empty() ? ktype : draft_k;
++  cfg.draft_value_cache = draft_v.empty() ? vtype : draft_v;
++  if (cfg.threads)
++    platform::SetEnv("OMP_NUM_THREADS", std::to_string(cfg.threads));
++  if (cfg.batch_threads || cfg.threads)
++    platform::SetEnv(
++        "RAYON_NUM_THREADS",
++        std::to_string(cfg.batch_threads ? cfg.batch_threads : cfg.threads));
++  if (!have_model)
++    throw std::invalid_argument("--model is required");
++  if (cfg.memory_mode != "" && cfg.memory_mode != "none" &&
++      cfg.memory_mode != "mmap" && cfg.memory_mode != "auto" &&
++      cfg.memory_mode != "dio" && cfg.memory_mode != "mlock" &&
++      cfg.memory_mode != "mmap+mlock")
++    unsupported("--load-mode",
++                "expected auto, none, mmap, mlock, mmap+mlock or dio");
++  if (cfg.draft_max && cfg.draft_min > cfg.draft_max)
++    unsupported("--spec-draft-n-min", "minimum exceeds maximum");
++  for (const auto& [name, value] : std::vector<std::pair<S, S>>{
++           {"GUFO_FLASH_CACHE_K", ktype},
++           {"GUFO_FLASH_CACHE_V", vtype},
++           {"GUFO_FLASH_DRAFT_CACHE_K", draft_k.empty() ? ktype : draft_k},
++           {"GUFO_FLASH_DRAFT_CACHE_V", draft_v.empty() ? vtype : draft_v}}) {
++    if (value != "q8_0" && value != "q4_0" && value != "f16")
++      unsupported(name, "supported cache types are q8_0, q4_0 and f16");
++    if (!platform::SetEnv(name, value))
++      throw std::runtime_error("failed to configure attention cache");
++  }
++  if (total == 0)
++    total = unified && per_slot ? per_slot * sessions : 262144u;
++  const unsigned context = unified
++                               ? (per_slot ? std::min(per_slot, total) : total)
++                               : total / sessions;
++  if (context < 2)
++    unsupported("--ctx-size", "effective session context is too short");
++  cfg.shared_context = unified ? total : 0;
++  out.insert(out.end(), {"--context", std::to_string(context), "--sessions",
++                         std::to_string(sessions), "--cache-ram-bytes",
++                         cfg.checkpoints == 0 ? "off"
++                         : !ram_cache.empty() ? ram_cache
++                         : context >= 1000000 ? "off"
++                                              : "6442450944"});
++  if (context > 262144)
++    out.push_back("--enable-yarn");
++  if (mode != "off" && mode != "none" && (!draft.empty() || !mode.empty())) {
++    if (mode != "" && mode != "mtp" && mode != "draft-mtp" &&
++        mode != "draft-simple")
++      unsupported("--spec-type", "this model implements external MTP");
++    if (draft.empty())
++      unsupported("--spec-draft-model", "select the separate MTP GGUF");
++    out.insert(out.end(), {"--speculative", "mtp", "--mtp-model", draft});
++  }
++  std::cerr << "[Studio load] argv:";
++  for (const auto& key : received)
++    std::cerr << " " << key;
++  std::cerr << "\n[Studio load] sessions=" << sessions << " context=" << context
++            << " shared_rows=" << cfg.shared_context << " batch=" << cfg.batch
++            << " ubatch=" << cfg.ubatch << " cpu_threads=" << cfg.threads
++            << " flash_attention=" << (cfg.flash_attention ? "on" : "off")
++            << " checkpoints=" << cfg.checkpoints << " target_k=" << ktype
++            << " target_v=" << vtype << " draft_max=" << cfg.draft_max
++            << " draft_min=" << cfg.draft_min
++            << " draft_p_min=" << cfg.draft_probability << "\n";
++  return out;
++}
++}  // namespace gufo::cli
+diff --git a/src/core/hip/weight_upload.cpp b/src/core/hip/weight_upload.cpp
+index b83ecb1..71759a6 100644
+--- a/src/core/hip/weight_upload.cpp
++++ b/src/core/hip/weight_upload.cpp
+@@ -15,6 +15,7 @@
+ 
+ #include "src/core/hip/host_allocations.hpp"
+ #include "src/core/platform/fs.hpp"
++#include "src/core/studio_load.hpp"
+ 
+ namespace gufo::hip {
+ namespace {
+@@ -124,15 +125,23 @@ struct WeightUpload::State {
+     // Each reader keeps an unbuffered description of the shard it reads, so
+     // concurrent readers never queue on one synchronous handle: Windows
+     // serializes synchronous I/O per file object, not per process.
++    const auto& mode = studio::Load().memory_mode;
++    if (mode == "mmap" || mode == "mmap+mlock" || mode == "auto") {
++      std::memcpy(slot.buffer,
++                  static_cast<const std::byte*>(shard.mapping) + task.offset,
++                  task.size);
++      read = true;
++    }
+     if (slot.direct_shard != task.shard) {
+       platform::CloseFile(slot.direct);
+       slot.direct = platform::kInvalidFile;
+       slot.direct_shard = task.shard;
+     }
+-    if (!platform::FileValid(slot.direct)) {
++    if (!read && mode != "none" && mode != "mlock" &&
++        !platform::FileValid(slot.direct)) {
+       slot.direct = platform::ReopenUnbuffered(shard.fd);
+     }
+-    if (platform::FileValid(slot.direct)) {
++    if (!read && platform::FileValid(slot.direct)) {
+       const auto begin = task.offset & ~(kAlignment - 1);
+       const auto skip = static_cast<std::size_t>(task.offset - begin);
+       const auto length =
+@@ -200,6 +209,15 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
+   std::unique_ptr<WeightUpload> uploader(new WeightUpload());
+   auto& s = *uploader->state_;
+   for (const auto& region : regions) {
++    if (studio::Load().memory_mode == "mlock" ||
++        studio::Load().memory_mode == "mmap+mlock") {
++      const auto issue = platform::LockModelMapping(region.data, region.size);
++      if (!issue.empty()) {
++        if (error)
++          *error = "--load-mode could not lock GGUF pages: " + issue;
++        return nullptr;
++      }
++    }
+     auto& shard = s.shards.emplace_back();
+     shard.fd = platform::DuplicateFile(region.file_descriptor);
+     std::error_code ec;
+@@ -214,7 +232,12 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
+     shard.size = info.size;
+     shard.mapping = region.data;
+   }
+-  for (auto& slot : s.slots) {
++  const auto requested = studio::Load().batch_threads
++                             ? studio::Load().batch_threads
++                             : studio::Load().threads;
++  const auto nreaders =
++      requested ? std::min<size_t>(kReaders, requested) : kReaders;
++  for (auto& slot : std::span(s.slots).first(nreaders)) {
+     if (s.host_allocations.Allocate(&slot.buffer, kChunkBytes + kAlignment) !=
+             hipSuccess ||
+         hipStreamCreateWithFlags(&slot.stream, hipStreamNonBlocking) !=
+@@ -225,7 +248,7 @@ std::unique_ptr<WeightUpload> WeightUpload::Create(
+     }
+   }
+   try {
+-    for (auto& slot : s.slots) {
++    for (auto& slot : std::span(s.slots).first(nreaders)) {
+       s.readers.emplace_back([&s, &slot] { s.Run(slot); });
+     }
+   } catch (const std::system_error& e) {
+diff --git a/src/core/platform/mapped_file.cpp b/src/core/platform/mapped_file.cpp
+index 12526f8..eb5db7c 100644
+--- a/src/core/platform/mapped_file.cpp
++++ b/src/core/platform/mapped_file.cpp
+@@ -16,6 +16,17 @@
+ #endif
+ 
+ namespace gufo::platform {
++std::string LockModelMapping(const void* data, std::size_t bytes) {
++#if defined(_WIN32)
++  if (!VirtualLock(const_cast<void*>(data), bytes))
++    return "VirtualLock refused by Windows (error " +
++           std::to_string(GetLastError()) + ")";
++#else
++  if (::mlock(data, bytes) != 0)
++    return std::strerror(errno);
++#endif
++  return {};
++}
+ namespace {
+ 
+ #if defined(_WIN32)
+diff --git a/src/core/platform/mapped_file.hpp b/src/core/platform/mapped_file.hpp
+index e3c7cc9..fb6a794 100644
+--- a/src/core/platform/mapped_file.hpp
++++ b/src/core/platform/mapped_file.hpp
+@@ -9,6 +9,10 @@
+ 
+ namespace gufo::platform {
+ 
++/// Lock an explicitly requested model mapping until it is unmapped. Returns an
++/// OS error on refusal.
++[[nodiscard]] std::string LockModelMapping(const void* data, std::size_t bytes);
++
+ /// Positional-read file handle: int fd on POSIX, HANDLE on Windows.
+ #if defined(_WIN32)
+ using PlatformFile = void*;
+diff --git a/src/core/studio_load.hpp b/src/core/studio_load.hpp
+new file mode 100644
+index 0000000..827b3e2
+--- /dev/null
++++ b/src/core/studio_load.hpp
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace gufo::studio {
++// Set before starting the worker. There is one served model per process.
++struct LoadSettings {
++  bool active{false};
++  std::uint32_t sessions{1};
++  std::string key_cache, value_cache, draft_key_cache, draft_value_cache;
++  std::uint32_t shared_context{0};
++  std::uint32_t batch{0}, ubatch{0}, threads{0}, batch_threads{0};
++  std::vector<std::string> option_names;
++  std::uint32_t draft_max{0}, draft_min{0};
++  int checkpoints{-1};
++  float draft_probability{-1};
++  float rope_base{0}, rope_scale{0};
++  bool flash_attention{true};
++  std::string chat_template, memory_mode, lazy_mode;
++};
++
++struct SharedUsage {
++  std::atomic<std::uint32_t> rows{0}, peak_rows{0};
++  std::atomic<std::uint64_t> mapped_bytes{0};
++};
++inline SharedUsage& Usage() {
++  static SharedUsage usage;
++  return usage;
++}
++
++inline LoadSettings& Load() {
++  static LoadSettings settings;
++  return settings;
++}
++}  // namespace gufo::studio
+diff --git a/src/families/qwen/vision/encoder.hip b/src/families/qwen/vision/encoder.hip
+index b3e3940..04baee1 100644
+--- a/src/families/qwen/vision/encoder.hip
++++ b/src/families/qwen/vision/encoder.hip
+@@ -1,4 +1,5 @@
+ #include <hip/hip_bfloat16.h>
++#include <hip/hip_fp16.h>
+ #include <hip/hip_runtime.h>
+ #include <hipblas/hipblas.h>
+ #include <openssl/evp.h>
+@@ -387,6 +388,12 @@ __global__ void Finish(float* output, const float* bias, unsigned size,
+     output[i] = Round(output[i] + bias[i % width]);
+ }
+ 
++__global__ void Fp16VisionWeights(__half* data, size_t count) {
++  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
++  if (i < count)
++    reinterpret_cast<Bf16*>(data)[i] = Bf16(__half2float(data[i]));
++}
++
+ std::uint16_t ToBf16(float value) {
+   const auto bits = std::bit_cast<std::uint32_t>(value);
+   return static_cast<std::uint16_t>((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+@@ -464,11 +471,14 @@ struct Encoder::Impl {
+       const auto* tensor = reader->FindTensor(name);
+       if (tensor == nullptr ||
+           tensor->dimensions != std::vector<std::uint64_t>(shape) ||
+-          tensor->type != type) {
++          (tensor->type != type &&
++           !(tensor->type == core::GgmlType::kF16 &&
++             (type == core::GgmlType::kBF16 ||
++              name.starts_with("v.patch_embd.weight"))))) {
+         throw std::invalid_argument("invalid BF16 Qwen vision tensor: " + name);
+       }
+-      const auto bytes =
+-          tensor->ElementCount() * (type == core::GgmlType::kF32 ? 4 : 2);
++      const auto bytes = tensor->ElementCount() *
++                         (tensor->type == core::GgmlType::kF32 ? 4 : 2);
+       const auto address = reinterpret_cast<std::uintptr_t>(tensor->data);
+       const bool mapped = std::any_of(
+           reader->GetMappedRegions().begin(), reader->GetMappedRegions().end(),
+@@ -547,19 +557,28 @@ struct Encoder::Impl {
+       Allocation buffer = Allocation::Weight(bytes);
+       bytes_uploaded += bytes;
+       upload.Copy(buffer.data, tensor.data, bytes);
++      if (tensor.type == core::GgmlType::kF16) {
++        Fp16VisionWeights<<<(tensor.ElementCount() + 255) / 256, 256, 0,
++                            stream>>>(static_cast<__half*>(buffer.data),
++                                      tensor.ElementCount());
++        Check(hipGetLastError());
++      }
+       weights.emplace(tensor.name, std::move(buffer));
+     }
+-    const auto* first = static_cast<const float*>(
+-        reader->FindTensor("v.patch_embd.weight")->data);
+-    const auto* second = static_cast<const float*>(
+-        reader->FindTensor("v.patch_embd.weight.1")->data);
++    const auto* first = reader->FindTensor("v.patch_embd.weight");
++    const auto* second = reader->FindTensor("v.patch_embd.weight.1");
++    const auto patch_value = [](const auto* tensor, size_t i) {
++      return tensor->type == core::GgmlType::kF16
++                 ? __half2float(static_cast<const __half*>(tensor->data)[i])
++                 : static_cast<const float*>(tensor->data)[i];
++    };
+     std::vector<std::uint16_t> patch(kHidden * kPatchDim);
+     for (unsigned h = 0; h < kHidden; ++h) {
+       for (unsigned c = 0; c < 3; ++c) {
+         for (unsigned t = 0; t < 2; ++t) {
+           for (unsigned p = 0; p < 256; ++p) {
+-            patch[h * kPatchDim + (c * 2 + t) * 256 + p] =
+-                ToBf16((t == 0 ? first : second)[(h * 3 + c) * 256 + p]);
++            patch[h * kPatchDim + (c * 2 + t) * 256 + p] = ToBf16(
++                patch_value(t == 0 ? first : second, (h * 3 + c) * 256 + p));
+           }
+         }
+       }
+diff --git a/src/models/qwen38_flash_next/continuation_adapter.cpp b/src/models/qwen38_flash_next/continuation_adapter.cpp
+index fb282f1..49aa9d8 100644
+--- a/src/models/qwen38_flash_next/continuation_adapter.cpp
++++ b/src/models/qwen38_flash_next/continuation_adapter.cpp
+@@ -432,6 +432,8 @@ void ContinuationAdapter::BeginRestore(
+     throw std::invalid_argument("inconsistent Flash-Next component frontiers");
+   // Allocate host capacity and coverage first; any refusal leaves execution
+   // valid. Guard all ranges while the original state is still readable.
++  state.session->session_->EnsureSharedRows(
++      static_cast<std::uint32_t>(std::max(target, draft)));
+   state.session->tokens_.reserve(target);
+   state.session->logits_.reserve(model_->VocabSize());
+   std::vector<Coverage> coverage(descriptors_.size());
+diff --git a/src/models/qwen38_flash_next/continuation_identity.cpp b/src/models/qwen38_flash_next/continuation_identity.cpp
+index 8c1b97a..8f0b6c1 100644
+--- a/src/models/qwen38_flash_next/continuation_identity.cpp
++++ b/src/models/qwen38_flash_next/continuation_identity.cpp
+@@ -1,5 +1,3 @@
+-#include "src/models/qwen38_flash_next/kv_format.hpp"
+-
+ #include "src/models/qwen38_flash_next/continuation_identity.hpp"
+ 
+ #include <algorithm>
+@@ -7,8 +5,10 @@
+ #include <stdexcept>
+ 
+ #include "gufo/ext/continuation.hpp"
++#include "src/core/studio_load.hpp"
+ #include "src/families/qwen/text/chat_template.hpp"
+ #include "src/models/qwen38_flash_next/engine.hpp"
++#include "src/models/qwen38_flash_next/kv_format.hpp"
+ 
+ namespace gufo::models::qwen38_flash_next {
+ 
+@@ -48,6 +48,13 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
+            << "position_policy=" << position_policy << '\n'
+            << "adapters=none\n";
+   if (const auto layout = KvFormatId(has_mtp)) identity << "kv_formats=" << layout << '\n';
++  if (studio::Load().active) {
++    const auto& cfg = studio::Load();
++    identity << "studio_compute_v1=" << cfg.flash_attention << ',' << cfg.batch
++             << ',' << cfg.ubatch << ',' << cfg.rope_base << ','
++             << cfg.rope_scale << ',' << cfg.draft_max << ',' << cfg.draft_min
++             << ',' << cfg.draft_probability << '\n';
++  }
+   if (has_mtp) {
+     identity << "draft_backend=qfn-mtp-v1\n"
+              << "draft_artifact_id=" << ext::kGgufIdentityScheme << ':'
+diff --git a/src/models/qwen38_flash_next/engine.cpp b/src/models/qwen38_flash_next/engine.cpp
+index 7646ede..07b311e 100644
+--- a/src/models/qwen38_flash_next/engine.cpp
++++ b/src/models/qwen38_flash_next/engine.cpp
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <type_traits>
+ 
++#include "src/core/studio_load.hpp"
+ #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+ #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
+ #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+@@ -107,6 +108,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
+     }
+     m->weights_->config.rope_scaling = *options.rope_scaling;
+   }
++  if (studio::Load().rope_base > 0)
++    m->weights_->config.rope_theta = studio::Load().rope_base;
+   const Config& c = m->weights_->config;
+   if (options.max_context == 0 || options.max_context > c.MaxContextLength()) {
+     AssignError(error_msg, "context exceeds the model's " +
+@@ -130,7 +133,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
+     const auto& t = m->weights_->ple_table;
+     m->ngram_ = NgramTable::Open(
+         m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
+-        t.rows, c.ple_head_dim, t.type, error_msg);
++        t.rows, c.ple_head_dim, t.type, error_msg, t.data);
+     if (!m->ngram_) {
+       return nullptr;
+     }
+@@ -201,7 +204,7 @@ std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
+   if (vision_) {
+     // Image-capable slots can first serve text. Prepare the stable RoPE
+     // descriptor before any graphs capture a null pointer: replacing it
+-    // later destroys those graphs during image admission (5–12 ms here).
++    // later destroys those graphs during image admission (5â€“12 ms here).
+     try {
+       native->PrepareVision(executor_->stream());
+     } catch (const std::exception& exception) {
+@@ -243,10 +246,15 @@ std::uint32_t Model::VocabSize() const noexcept {
+ }
+ 
+ std::uint32_t Model::PrefillCapacity() const noexcept {
+-  return std::min(kPrefillChunkTokens, options_.max_context);
++  const auto& load = studio::Load();
++  const auto logical = load.batch ? load.batch : kPrefillChunkTokens;
++  return std::min(
++      {logical, load.ubatch ? load.ubatch : logical, options_.max_context});
+ }
+ 
+ std::uint32_t Model::PrefillThroughCapacity() const noexcept {
++  if (studio::Load().ubatch || studio::Load().batch)
++    return PrefillCapacity();
+   return std::min(kPrefillChunkTokens + kPrefillTailTokens,
+                   options_.max_context);
+ }
+@@ -1040,8 +1048,12 @@ struct Session::PendingDecode {
+ };
+ 
+ bool Session::GateStops(const PendingDecode& pending) {
+-  if (!pending.gated)
++  if (!pending.gated || pending.chain.size() <= studio::Load().draft_min)
+     return false;
++  if (studio::Load().draft_probability >= 0)
++    return (pending.sampled
++                ? pending.proposals.back().probability
++                : pending.draft_confidence) < studio::Load().draft_probability;
+   return pending.sampled
+              ? pending.proposals.back().probability < kMtpSampledGateProbability
+              : pending.draft_confidence < kMtpGateProbability;
+@@ -1161,6 +1173,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
+       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
+                                        model_->options_.max_draft_tokens);
+   }
++  if (MtpEnabled() && cap > 1 && studio::Load().draft_min)
++    drafts = std::max(drafts, static_cast<std::uint32_t>(std::min<size_t>(
++                                  cap - 1, studio::Load().draft_min)));
+   const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
+   if (width == 0) {
+     result->stop = true;
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/batch.cpp b/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
+index 2b10ead..a6f790d 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
+@@ -231,6 +231,9 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
+   }
+   for (const auto& item : items) {
+     auto& session = *item.session;
++    if (!session.Cancelled())
++      session.EnsureSharedRows(session.mtp_.position +
++                               static_cast<std::uint32_t>(item.tokens.size()));
+     if (!session.Cancelled() && session.continuation_hooks_) {
+       const auto end = session.mtp_.position +
+                        static_cast<std::uint32_t>(item.tokens.size());
+@@ -745,7 +748,7 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
+     const auto full = rows / kDecodeRows * kDecodeRows;
+     return project(0, full) && (full == rows || project(full, rows - full));
+   }
+-  // Three matrix tiles help 33–48 rows; four tiles cost more than two
++  // Three matrix tiles help 33â€“48 rows; four tiles cost more than two
+   // 32-row launches. Small outputs with long K sweeps stay at eight.
+   const auto chunk =
+       ((w.cols == 2560 && w.rows >= 1024) || (w.cols == 320 && w.rows == 10240))
+@@ -905,6 +908,9 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
+     return true;
+   for (const auto& item : items) {
+     auto& session = *item.session;
++    if (!session.Cancelled())
++      session.EnsureSharedRows(session.position_ +
++                               static_cast<std::uint32_t>(item.tokens.size()));
+     if (!session.Cancelled() && session.continuation_hooks_) {
+       const auto end =
+           session.position_ + static_cast<std::uint32_t>(item.tokens.size());
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+index 159f929..0d3b0ae 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+@@ -1,4 +1,3 @@
+-#include <cstdio>
+ #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+ 
+ #include <algorithm>
+@@ -8,6 +7,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstddef>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <exception>
+@@ -24,6 +24,7 @@
+ #include <vector>
+ 
+ #include "qfn_mmq.h"
++#include "src/core/studio_load.hpp"
+ #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+ #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+ 
+@@ -743,7 +744,8 @@ bool Session::CheckCancellation(std::string* error) const {
+ }
+ 
+ std::size_t Session::AllocatedBytes() const noexcept {
+-  return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
++  return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes() +
++         (shared_kv_ ? shared_kv_->Bytes() : 0);
+ }
+ 
+ PrefillCheckpoint::~PrefillCheckpoint() {
+@@ -915,6 +917,10 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
+ }
+ 
+ void Session::Reset(bool reuse_mtp) {
++  if (shared_kv_) {
++    PreserveSnapshots(0, 0);
++    shared_kv_->Reset();
++  }
+   // Reset leaves append-only rows intact. Preserve them at the first write
+   // that would overwrite them, allowing cancellation to resume by rewind.
+   // Scratch is overwritten by the next verification. Retaining its stable
+@@ -1033,10 +1039,26 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
+     return nullptr;
+   }
+   e->context_capacity_ = std::max(c.context_length, options.max_context);
++  if (studio::Load().shared_context)
++    e->shared_budget_ =
++        std::make_shared<SharedKvBudget>(studio::Load().shared_context);
+   e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
+   // With YaRN configured, a session runs unscaled while it fits the native
+   // context and takes the smallest whole factor covering its positions past
+   // it, up to the configured one (SetYarnFactor re-rotates its cached keys).
++  if (studio::Load().rope_scale > 0 && studio::Load().rope_scale != 1.0f) {
++    if (c.rope_scaling.Enabled()) {
++      AssignError(
++          error_msg,
++          "manual --rope-freq-scale cannot be combined with automatic YaRN");
++      return nullptr;
++    }
++    e->yarn_ = {.enabled = 1,
++                .low = -2,
++                .high = -1,
++                .inv_factor = studio::Load().rope_scale,
++                .mscale = 1};
++  }
+   if (c.rope_scaling.Enabled()) {
+     e->dynamic_yarn_ = true;
+     e->yarn_max_ = c.rope_scaling;
+@@ -1417,6 +1439,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+     return nullptr;
+   }
+   s->max_context_ = max_context;
++  if (shared_budget_)
++    s->shared_kv_ = std::make_unique<SharedKvSlot>(shared_budget_, max_context);
+   // Before sparse attention starts, pooling can lag by indexer_top_k
+   // rows. Afterwards only an incomplete block precedes the current batch.
+   // Completed block keys remain in block_k; their raw rows are dead.
+@@ -1425,6 +1449,13 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+   s->attention_.resize(c.num_layers);
+   auto& a = s->allocations_;
+   const std::size_t kv_row = c.AttentionKvDim();
++  const auto cache_column = [&](KvType type) {
++    const auto bytes = KvRowBytes(type, kv_row);
++    if (s->shared_kv_)
++      return s->shared_kv_->Column(bytes);
++    return Alloc<__half>(a, size_t(max_context) * bytes / sizeof(__half),
++                         error_msg, &s->allocated_bytes_);
++  };
+   const std::size_t conv_elems =
+       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
+@@ -1437,12 +1468,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
+     } else {
+       auto& at = s->attention_[il];
+-      at.k_cache =
+-          Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().target.k, kv_row) / 2,
+-                        error_msg, &s->allocated_bytes_);
+-      at.v_cache =
+-          Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().target.v, kv_row) / 2,
+-                        error_msg, &s->allocated_bytes_);
++      at.k_cache = cache_column(FlashKvFormats().target.k);
++      at.v_cache = cache_column(FlashKvFormats().target.v);
+       at.index_k = Alloc<float>(
+           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
+           error_msg, &s->allocated_bytes_);
+@@ -1467,12 +1494,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+                          std::max(options_.max_speculative, max_copy_rows())) *
+                          c.HcDim(),
+                      error_msg, &s->allocated_bytes_);
+-    s->mtp_.k_cache =
+-        Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().draft.k, kv_row) / 2,
+-                      error_msg, &s->allocated_bytes_);
+-    s->mtp_.v_cache =
+-        Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().draft.v, kv_row) / 2,
+-                      error_msg, &s->allocated_bytes_);
++    s->mtp_.k_cache = cache_column(FlashKvFormats().draft.k);
++    s->mtp_.v_cache = cache_column(FlashKvFormats().draft.v);
+     s->mtp_.index_k =
+         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
+                      error_msg, &s->allocated_bytes_);
+@@ -3115,7 +3138,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
+                                 c.head_dim, c.compress_ratio, stream_, last));
+   };
+-  if (checkpoints.count != 0 && checkpoints.tokens[0] < n_tokens) {
++  if (studio::Load().flash_attention && checkpoints.count != 0 &&
++      checkpoints.tokens[0] < n_tokens) {
+     // Sparse tiles compact the union of their queries' selected keys.
+     // Keep each checkpoint's query grouping identical to a pass ending
+     // there.
+@@ -3133,7 +3157,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+     return !project_output ||
+            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+   }
+-  if (MatrixRows(n_tokens) && attend(0, n_tokens, last_only)) {
++  if (studio::Load().flash_attention && MatrixRows(n_tokens) &&
++      attend(0, n_tokens, last_only)) {
+     return !project_output ||
+            Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+   }
+@@ -3663,6 +3688,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
+       return false;
+     }
+   }
++  session.EnsureSharedRows(session.position_ + n);
+   const std::uint32_t start_pos = session.position_;
+   if (!session.CheckCancellation(error_msg))
+     return false;
+@@ -4842,6 +4868,7 @@ bool Executor::RestoreSnapshot(Session& session,
+                  error_msg);
+   };
+ 
++  session.EnsureSharedRows(std::max(h.position, h.mtp_position));
+   if (WalkSnapshot(
+           h, &session,
+           [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+@@ -5218,6 +5245,7 @@ bool Executor::MtpForward(Session& session,
+     AssignError(error_msg, "MTP context is full");
+     return false;
+   }
++  session.EnsureSharedRows(pos + n);
+   if (session.continuation_hooks_)
+     session.continuation_hooks_->BeforeWrite(
+         true, pos, pos + n, session.mtp_.blocks,
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/executor.hpp b/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+index d885a0d..7922010 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+@@ -1,8 +1,6 @@
+ #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+ #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+ 
+-#include "src/models/qwen38_flash_next/kv_format.hpp"
+-
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_runtime.h>
+ #include <hipblas/hipblas.h>
+@@ -28,6 +26,8 @@
+ #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
+ #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+ #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
++#include "src/models/qwen38_flash_next/kernels/rocm/shared_kv.hpp"
++#include "src/models/qwen38_flash_next/kv_format.hpp"
+ #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
+ #include "src/models/qwen38_flash_next/ngram.hpp"
+ 
+@@ -117,6 +117,10 @@ public:
+   /// Drops every token; the next Forward starts at position 0. Cache slot
+   /// reassignment may retain bounded MTP scratch and its recorded graphs.
+   void Reset(bool reuse_mtp = false);
++  void EnsureSharedRows(std::uint32_t end) {
++    if (shared_kv_)
++      shared_kv_->Ensure(end);
++  }
+   void SetCancellationCheck(std::function<bool()> check);
+   [[nodiscard]] bool CheckCancellation(std::string* error) const;
+   [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
+@@ -193,6 +197,7 @@ private:
+   std::uint64_t mutation_epoch_{0};
+   const Executor* owner_{nullptr};
+   qwen::vision::DeviceInput vision_input_;
++  std::unique_ptr<SharedKvSlot> shared_kv_;
+   std::uint32_t max_context_{0};
+   bool mtp_enabled_{false};
+   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
+@@ -902,6 +907,7 @@ private:
+   std::uint32_t mask_words_{0};
+   /// Session capacity the sparse-mask rows and score scratch are sized for:
+   /// max(native context, Options::max_context).
++  std::shared_ptr<SharedKvBudget> shared_budget_;
+   std::uint32_t context_capacity_{0};
+   /// YaRN constants every rope launch receives (disabled: original path).
+   /// With dynamic YaRN they are the running session's (UseYarn).
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/shared_kv.hpp b/src/models/qwen38_flash_next/kernels/rocm/shared_kv.hpp
+new file mode 100644
+index 0000000..f28f052
+--- /dev/null
++++ b/src/models/qwen38_flash_next/kernels/rocm/shared_kv.hpp
+@@ -0,0 +1,174 @@
++#pragma once
++
++#include <hip/hip_fp16.h>
++#include <hip/hip_runtime.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++#include "src/core/studio_load.hpp"
++
++namespace gufo::models::qwen38_flash_next::rocm {
++
++// Each slot has stable virtual addresses for captured HIP graphs. The common
++// budget charges token rows; physical mappings grow only for rows a slot uses.
++class SharedKvBudget {
++public:
++  explicit SharedKvBudget(std::uint32_t tokens) : limit(tokens) {
++    props.type = hipMemAllocationTypePinned;
++    props.location.type = hipMemLocationTypeDevice;
++    Check(hipGetDevice(&props.location.id));
++    Check(hipMemGetAllocationGranularity(&granularity, &props,
++                                         hipMemAllocationGranularityMinimum));
++  }
++  void Claim(std::uint32_t n) {
++    std::lock_guard lock(mutex);
++    if (n > limit - used)
++      throw std::length_error("shared KV context is full (" +
++                              std::to_string(used) + " of " +
++                              std::to_string(limit) + " token rows in use)");
++    used += n;
++    studio::Usage().rows.store(used);
++    if (used > studio::Usage().peak_rows.load())
++      studio::Usage().peak_rows.store(used);
++  }
++  void GiveBack(std::uint32_t n) noexcept {
++    std::lock_guard lock(mutex);
++    used -= n;
++    studio::Usage().rows.store(used);
++  }
++  std::size_t Align(std::size_t n) const {
++    return (n + granularity - 1) / granularity * granularity;
++  }
++  static void Check(hipError_t rc) {
++    if (rc != hipSuccess)
++      throw std::runtime_error(std::string("shared HIP KV allocation: ") +
++                               hipGetErrorString(rc));
++  }
++  const std::uint32_t limit;
++  hipMemAllocationProp props{};
++  std::size_t granularity{};
++
++private:
++  std::mutex mutex;
++  std::uint32_t used{0};
++};
++
++class SharedKvSlot {
++  struct Mapping {
++    std::size_t offset, bytes;
++    hipMemGenericAllocationHandle_t handle;
++  };
++  struct Range {
++    void* address{};
++    std::size_t row_bytes{}, span{}, committed{};
++    std::vector<Mapping> mappings;
++  };
++
++public:
++  SharedKvSlot(std::shared_ptr<SharedKvBudget> budget, std::uint32_t capacity)
++      : budget_(std::move(budget)), capacity_(capacity) {}
++  SharedKvSlot(const SharedKvSlot&) = delete;
++  SharedKvSlot& operator=(const SharedKvSlot&) = delete;
++  ~SharedKvSlot() {
++    if (rows_)
++      (void)hipDeviceSynchronize();
++    Clear();
++    for (auto& col : columns_)
++      if (col.address)
++        (void)hipMemAddressFree(col.address, col.span);
++  }
++  __half* Column(std::size_t row_bytes) {
++    auto& r = columns_.emplace_back();
++    r.row_bytes = row_bytes;
++    r.span = budget_->Align(row_bytes * capacity_);
++    SharedKvBudget::Check(
++        hipMemAddressReserve(&r.address, r.span, 0, nullptr, 0));
++    return static_cast<__half*>(r.address);
++  }
++  void Ensure(std::uint32_t end) {
++    if (end <= rows_)
++      return;
++    if (end > capacity_)
++      throw std::length_error("KV write exceeds per-session capacity");
++    const auto delta = end - rows_;
++    budget_->Claim(delta);
++    const auto target = std::min(capacity_, ((end - 1) / 2048 + 1) * 2048u);
++    if (target > backed_rows_) {
++      try {
++        for (auto& r : columns_)
++          Extend(r, budget_->Align(r.row_bytes * target));
++      } catch (...) {
++        for (auto& r : columns_)
++          Trim(r, budget_->Align(r.row_bytes * backed_rows_));
++        budget_->GiveBack(delta);
++        throw;
++      }
++      backed_rows_ = target;
++    }
++    rows_ = end;
++  }
++  void Reset() {
++    if (rows_)
++      SharedKvBudget::Check(hipDeviceSynchronize());
++    Clear();
++  }
++  std::size_t Bytes() const {
++    std::size_t bytes = 0;
++    for (const auto& r : columns_)
++      bytes += r.committed;
++    return bytes;
++  }
++
++private:
++  void Extend(Range& r, std::size_t end) {
++    if (end <= r.committed)
++      return;
++    r.mappings.reserve(r.mappings.size() + 1);
++    const auto bytes = end - r.committed;
++    auto* at = static_cast<std::uint8_t*>(r.address) + r.committed;
++    hipMemGenericAllocationHandle_t handle{};
++    SharedKvBudget::Check(hipMemCreate(&handle, bytes, &budget_->props, 0));
++    auto rc = hipMemMap(at, bytes, 0, handle, 0);
++    if (rc == hipSuccess) {
++      hipMemAccessDesc access{budget_->props.location,
++                              hipMemAccessFlagsProtReadWrite};
++      rc = hipMemSetAccess(at, bytes, &access, 1);
++      if (rc != hipSuccess)
++        (void)hipMemUnmap(at, bytes);
++    }
++    if (rc != hipSuccess) {
++      (void)hipMemRelease(handle);
++      SharedKvBudget::Check(rc);
++    }
++    r.mappings.push_back({r.committed, bytes, handle});
++    r.committed = end;
++    studio::Usage().mapped_bytes.fetch_add(bytes);
++  }
++  static void Trim(Range& r, std::size_t keep) noexcept {
++    while (!r.mappings.empty() && r.mappings.back().offset >= keep) {
++      const auto m = r.mappings.back();
++      (void)hipMemUnmap(static_cast<std::uint8_t*>(r.address) + m.offset,
++                        m.bytes);
++      (void)hipMemRelease(m.handle);
++      r.committed = m.offset;
++      studio::Usage().mapped_bytes.fetch_sub(m.bytes);
++      r.mappings.pop_back();
++    }
++  }
++  void Clear() noexcept {
++    for (auto& r : columns_)
++      Trim(r, 0);
++    budget_->GiveBack(rows_);
++    rows_ = backed_rows_ = 0;
++  }
++  std::shared_ptr<SharedKvBudget> budget_;
++  std::vector<Range> columns_;
++  std::uint32_t capacity_, rows_{0}, backed_rows_{0};
++};
++}  // namespace gufo::models::qwen38_flash_next::rocm
+diff --git a/src/models/qwen38_flash_next/ngram.cpp b/src/models/qwen38_flash_next/ngram.cpp
+index a6ca36e..19d0599 100644
+--- a/src/models/qwen38_flash_next/ngram.cpp
++++ b/src/models/qwen38_flash_next/ngram.cpp
+@@ -1,5 +1,6 @@
+ #include "src/models/qwen38_flash_next/ngram.hpp"
+ 
++#include "src/core/studio_load.hpp"
+ #include "src/models/qwen38_flash_next/ngram_remainder.hpp"
+ 
+ #if defined(__GNUC__) && defined(__x86_64__)
+@@ -117,7 +118,8 @@ NgramTable::~NgramTable() {
+ 
+ std::unique_ptr<NgramTable> NgramTable::Open(
+     platform::PlatformFile file, std::uint64_t file_offset, std::uint64_t rows,
+-    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
++    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg,
++    const void* mapped) {
+   std::unique_ptr<NgramTable> t(new NgramTable());
+   const bool blocked =
+       type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kQ8_0;
+@@ -135,6 +137,19 @@ std::unique_ptr<NgramTable> NgramTable::Open(
+   t->type_ = type;
+   t->row_dim_ = row_dim;
+   t->row_bytes_ = row_dim / block * block_bytes;
++  const auto& load = studio::Load();
++  const auto table_bytes = rows * t->row_bytes_;
++  if (mapped && (load.lazy_mode == "off" ||
++                 (load.lazy_mode == "auto" && table_bytes <= (4ull << 30)))) {
++    if (load.memory_mode == "mlock" || load.memory_mode == "mmap+mlock") {
++      t->resident_rows_ = static_cast<const std::uint8_t*>(mapped);
++    } else {
++      t->owned_rows_ =
++          std::make_unique_for_overwrite<std::uint8_t[]>(table_bytes);
++      std::memcpy(t->owned_rows_.get(), mapped, table_bytes);
++      t->resident_rows_ = t->owned_rows_.get();
++    }
++  }
+   t->cache_count_ = std::bit_floor(kCacheBytes / t->row_bytes_);
+   t->cache_entries_ = std::make_unique<CacheEntry[]>(t->cache_count_);
+   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
+@@ -154,7 +169,9 @@ std::unique_ptr<NgramTable> NgramTable::Open(
+     }
+     return nullptr;
+   }
+-  for (std::size_t i = 0; i < kWorkers; ++i) {
++  const size_t workers =
++      load.threads ? std::min<size_t>(kWorkers, load.threads) : kWorkers;
++  for (std::size_t i = 0; i < workers; ++i) {
+     t->workers_.emplace_back([raw = t.get()] { raw->Worker(); });
+   }
+   return t;
+@@ -183,6 +200,11 @@ void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
+ }
+ 
+ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
++  if (resident_rows_ && row < rows_) {
++    DecodeRow(resident_rows_ + size_t(row) * row_bytes_, dst);
++    return true;
++  }
++
+   if (cache_count_ == 0) {
+     return false;
+   }
+diff --git a/src/models/qwen38_flash_next/ngram.hpp b/src/models/qwen38_flash_next/ngram.hpp
+index 5df3198..f713cee 100644
+--- a/src/models/qwen38_flash_next/ngram.hpp
++++ b/src/models/qwen38_flash_next/ngram.hpp
+@@ -86,7 +86,7 @@ public:
+   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
+       platform::PlatformFile file, std::uint64_t file_offset,
+       std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
+-      std::string* error_msg = nullptr);
++      std::string* error_msg = nullptr, const void* mapped = nullptr);
+ 
+   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
+   /// Duplicate ids are read once. Returns false on any failed read.
+@@ -141,6 +141,8 @@ private:
+ 
+   platform::PlatformFile file_{platform::kInvalidFile};
+   bool direct_{false};
++  std::unique_ptr<std::uint8_t[]> owned_rows_;
++  const std::uint8_t* resident_rows_{nullptr};
+   std::uint64_t base_offset_{0};
+   std::uint64_t rows_{0};
+   std::uint32_t row_dim_{0};
+diff --git a/src/models/qwen38_flash_next/runner.cpp b/src/models/qwen38_flash_next/runner.cpp
+index ed7425a..d3b7af7 100644
+--- a/src/models/qwen38_flash_next/runner.cpp
++++ b/src/models/qwen38_flash_next/runner.cpp
+@@ -1,5 +1,9 @@
+ #include "src/models/qwen38_flash_next/runner.hpp"
+ 
++#include <fstream>
++
++#include "src/core/studio_load.hpp"
++
+ #if defined(ENGINE_ENABLE_HIP)
+ 
+ #include <algorithm>
+@@ -348,7 +352,10 @@ public:
+         .sampling_defaults = FlashNextSamplingDefaults(),
+         .scheduling =
+             TextSchedulingProfile{
+-                .pass_tokens = model_->PrefillCapacity(),
++                .pass_tokens =
++                    studio::Load().batch
++                        ? std::min(studio::Load().batch, max_context_)
++                        : model_->PrefillCapacity(),
+                 .max_layer_groups = kMaxPrefillLayerGroups,
+                 .max_yield_decode_width = kMaxBatchWidth,
+             },
+@@ -360,25 +367,48 @@ public:
+         use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                  : gufo::core::SessionMode::kAutoregressive,
+         max_context_);
++    const auto& formats = FlashKvFormats();
++    const auto& c = model_->config();
++    const auto row_bytes = [&](KvPair fmt) {
++      return KvRowBytes(fmt.k, c.AttentionKvDim()) +
++             KvRowBytes(fmt.v, c.AttentionKvDim());
++    };
++    const auto bytes_per_token =
++        c.num_layers / c.full_attention_interval * row_bytes(formats.target) +
++        (use_mtp_ ? row_bytes(formats.draft) : 0);
++    const std::size_t shared = studio::Load().shared_context;
++    const std::size_t private_state =
++        shared ? session_bytes - bytes_per_token * max_context_ : session_bytes;
+     std::optional<std::size_t> capacity;
+     if (const auto memory = gufo::hip::QueryAdmissionMemory()) {
+       const auto deferred = model_->DeferredScratchBytes();
+       capacity =
+           memory->free_bytes > deferred ? memory->free_bytes - deferred : 0;
+       gufo::hip::LogStateCapacity(*memory, *capacity, session_bytes, deferred);
++      if (shared) {
++        // A slot can retain a partial 2048-row mapping in each column.
++        const auto reserve =
++            bytes_per_token * (shared + size_t(studio::Load().sessions) * 2048);
++        capacity = *capacity > reserve ? *capacity - reserve : 0;
++      }
+     }
+     // Admission charges complete snapshot payloads. Flash-Next can retain
+     // mutable state and protected K/V rows in private device storage.
+     return {
+         .resident_weights_bytes = model_->ResidentBytes(),
+         .state_capacity_bytes = capacity,
+-        .per_request_state_bytes = session_bytes,
++        .per_request_state_bytes = private_state,
+         // Runtime scratch is shared and already allocated at model load;
+         // reserve its remaining lazy buffers once from aggregate capacity.
+         .temporary_scratch_bytes = 0,
+         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+         .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
+         .requires_device_runtime_lock = true,
++        .prompt_state_bytes_per_token =
++            shared ? std::optional<size_t>(bytes_per_token) : std::nullopt,
++        .prompt_admission_budget_bytes =
++            shared ? std::optional<size_t>(shared * bytes_per_token)
++                   : std::nullopt,
+     };
+   }
+ 
+@@ -849,6 +879,30 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
+       *error = "Flash-Next requires architecture qwen4exp";
+     return nullptr;
+   }
++  if (!studio::Load().chat_template.empty()) {
++    std::ifstream file(studio::Load().chat_template, std::ios::binary);
++    if (!file) {
++      if (error)
++        *error = "cannot read --chat-template-file";
++      return nullptr;
++    }
++    const std::string supplied((std::istreambuf_iterator<char>(file)), {});
++    const auto built_in = reader->GetMetadataString("tokenizer.chat_template");
++    auto normalize = [](std::string_view input) {
++      std::string result(input);
++      std::erase(result, '\r');
++      while (!result.empty() && (result.back() == '\n' || result.back() == ' '))
++        result.pop_back();
++      return result;
++    };
++    if (!built_in || normalize(supplied) != normalize(*built_in)) {
++      if (error)
++        *error =
++            "--chat-template-file differs from the GGUF Qwen template; the "
++            "native renderer cannot execute custom Jinja";
++      return nullptr;
++    }
++  }
+   const std::uint32_t qwen4exp_native_context =
+       reader->GetMetadataUint32("qwen4exp.context_length").value_or(0);
+   std::uint32_t max_context = options.max_context;
+@@ -887,6 +941,9 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
+           .max_context = max_context,
+           .mtp_model_path =
+               use_mtp ? options.speculative.draft_model_path : std::string{},
++          .max_draft_tokens = studio::Load().draft_max
++                                  ? studio::Load().draft_max
++                                  : kMaxMtpDraftTokens,
+           .vision_model_path = options.vision_model_path,
+           .decode_concurrency =
+               DecodeConcurrencyForSessions(options.session_count),

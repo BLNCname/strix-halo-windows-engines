@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import zipfile
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROFILES = ["Q4_K_XL", "IQ4_XS", "Q3_K_XL"]
 
 
@@ -16,7 +16,7 @@ def package(exe, source, output):
     if "third-party/llama.cpp.txt" not in files or "third-party/hip.txt" not in files:
         raise ValueError("Gufo source notices are missing")
     data = {name: path.read_bytes() for name, path in files.items()}
-    manifest = {"schema": 1, "version": VERSION, "native": "0.35.0-strix.2", "target": "windows-x64-gfx1151",
+    manifest = {"schema": 1, "version": VERSION, "native": "0.35.0-strix.3", "target": "windows-x64-gfx1151",
                 "context": 262144, "profiles": PROFILES,
                 "files": {name: hashlib.sha256(buf).hexdigest() for name, buf in data.items()}}
     data["engine.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()

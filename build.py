@@ -8,7 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 UPSTREAM = "https://github.com/gufo-org/gufo.git"
 REVISION = "0260e1162f8713caee4d3f4ff77e017de7165f9c"
-VERSION = "0.35.0-strix.2"
+VERSION = "0.35.0-strix.3"
 
 
 def build(work, cmake_args, jobs):
@@ -22,7 +22,7 @@ def build(work, cmake_args, jobs):
     head = subprocess.check_output(["git", "-C", src, "rev-parse", "HEAD"], text=True).strip()
     if head != REVISION:
         raise ValueError(f"Unexpected upstream revision {head}")
-    for patch in ("mixed-gguf.patch", "kv-cache.patch"):
+    for patch in ("mixed-gguf.patch", "kv-cache.patch", "studio-load.patch"):
         subprocess.run(["git", "-C", src, "apply", "--whitespace=error", ROOT / patch], check=True)
     env = os.environ.copy()
     # Rust panic locations and clang __FILE__ can otherwise retain profile paths.
@@ -42,7 +42,7 @@ def build(work, cmake_args, jobs):
     subprocess.run(["cmake", "-S", src, "-B", out, *configure, "-DCMAKE_BUILD_TYPE=Release",
                     "-DGUFO_EXTENSIONS=qwen38_flash_next", "-DGUFO_BUILD_TOOLS=OFF", "-DBUILD_TESTING=OFF",
                     "-DCMAKE_HIP_FLAGS_RELEASE=/clang:-O3 /DNDEBUG", "-DCMAKE_HIP_ARCHITECTURES=gfx1151",
-                    f"-DGUFO_RELEASE_VERSION={VERSION}", "-DGUFO_REVISION=0260e11-strix.2"], cwd=src, env=env, check=True)
+                    f"-DGUFO_RELEASE_VERSION={VERSION}", "-DGUFO_REVISION=0260e11-strix.3"], cwd=src, env=env, check=True)
     subprocess.run(["cmake", "--build", out, "--config", "Release", "--target", "gufo", "--parallel", str(jobs)],
                    cwd=src, env=env, check=True)
 
