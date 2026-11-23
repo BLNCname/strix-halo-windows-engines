@@ -1,0 +1,612 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index beec4db..5dc72ce 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -527,10 +527,10 @@ gufo_stage_hip_runtime(gufo)
+ target_compile_definitions(gufo PRIVATE
+   GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
+   GUFO_REVISION="${GUFO_REVISION}"
+-  GUFO_EVAL_SOURCE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/eval/antirez-ds4.json"
+-  GUFO_EVAL_INSTALLED_DATA="${CMAKE_INSTALL_PREFIX}/share/gufo/eval/antirez-ds4.json"
+-  GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+-  GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
++  GUFO_EVAL_SOURCE_DATA="share/gufo/eval/antirez-ds4.json"
++  GUFO_EVAL_INSTALLED_DATA="share/gufo/eval/antirez-ds4.json"
++  GUFO_H3_SOURCE_MANIFEST="share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
++  GUFO_H3_INSTALLED_SOURCE_MANIFEST="share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+ 
+ if (ENGINE_ENABLE_HIP)
+   target_link_libraries(gufo PRIVATE gufo_cache_hip)
+diff --git a/cmake/toolchains/windows-therock.cmake b/cmake/toolchains/windows-therock.cmake
+index b1508fc..ea8a43d 100644
+--- a/cmake/toolchains/windows-therock.cmake
++++ b/cmake/toolchains/windows-therock.cmake
+@@ -20,5 +20,7 @@ endif()
+ set(CMAKE_C_COMPILER "${GUFO_CLANG_CL}")
+ set(CMAKE_CXX_COMPILER "${GUFO_CLANG_CL}")
+ set(CMAKE_HIP_COMPILER "${GUFO_CLANG_CL}")
++# clang-cl ignores bare -O3; pass release optimization through to device cc1.
++set(CMAKE_HIP_FLAGS_RELEASE_INIT "/clang:-O3 /DNDEBUG")
+ list(APPEND CMAKE_PREFIX_PATH "${GUFO_HIP_ROOT}")
+ set(ROCM_PATH "${GUFO_HIP_ROOT}" CACHE PATH "HIP runtime root")
+diff --git a/include/gufo/ext/changes/0.3/q2-0-tensor-layout.md b/include/gufo/ext/changes/0.3/q2-0-tensor-layout.md
+new file mode 100644
+index 0000000..102c305
+--- /dev/null
++++ b/include/gufo/ext/changes/0.3/q2-0-tensor-layout.md
+@@ -0,0 +1,3 @@
++# Q2_0 tensor layout
++
++The GGUF reader recognizes GGML type 42 as Q2_0. A block contains one FP16 scale and 64 two-bit codes in 18 bytes.
+diff --git a/src/core/gguf_reader.hpp b/src/core/gguf_reader.hpp
+index 0736f42..0f0584e 100644
+--- a/src/core/gguf_reader.hpp
++++ b/src/core/gguf_reader.hpp
+@@ -47,6 +47,7 @@ enum class GgmlType : std::uint16_t {
+   kI32 = 26,
+   kIQ1_M = 29,
+   kBF16 = 30,
++  kQ2_0 = 42,
+ };
+ 
+ [[nodiscard]] constexpr std::string_view ToString(GgmlType type) noexcept {
+@@ -61,6 +62,8 @@ enum class GgmlType : std::uint16_t {
+       return "Q4_1";
+     case GgmlType::kQ5_0:
+       return "Q5_0";
++    case GgmlType::kQ2_0:
++      return "Q2_0";
+     case GgmlType::kQ5_1:
+       return "Q5_1";
+     case GgmlType::kQ8_0:
+diff --git a/src/core/npu/CMakeLists.txt b/src/core/npu/CMakeLists.txt
+index a0b85c5..208e640 100644
+--- a/src/core/npu/CMakeLists.txt
++++ b/src/core/npu/CMakeLists.txt
+@@ -41,4 +41,4 @@ if(MSVC)
+ else()
+   set_source_files_properties(host_ops.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-O3")
+ endif()
+-target_compile_definitions(gufo_npu PRIVATE "GUFO_NPU_BUILD_DESIGNS=\"${GUFO_NPU_DESIGN_ROOT}\"")
++target_compile_definitions(gufo_npu PRIVATE "GUFO_NPU_BUILD_DESIGNS=\"npu\"")
+diff --git a/src/core/quant/ggml_dequant.cpp b/src/core/quant/ggml_dequant.cpp
+index 0e9833d..ee285aa 100644
+--- a/src/core/quant/ggml_dequant.cpp
++++ b/src/core/quant/ggml_dequant.cpp
+@@ -187,6 +187,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
+     case core::GgmlType::kQ8_1:
+       block_bytes = 36;
+       break;
++    case core::GgmlType::kQ2_0:
++      block_bytes = 18;
++      break;
+     case core::GgmlType::kQ2_K:
+       block_bytes = 84;
+       break;
+@@ -1088,6 +1091,16 @@ bool DequantizeRow(core::GgmlType type, const void* src, float* dst,
+     case core::GgmlType::kQ2_K:
+       DequantizeQ2_K(src, dst, k);
+       return true;
++    case core::GgmlType::kQ2_0:
++      for (std::size_t b = 0; b < k / 64; ++b) {
++        const auto* packed = bytes + 18 * b;
++        const float d = Fp16ToFloat(LoadU16(packed));
++        for (unsigned i = 0; i < 64; ++i) {
++          const int q = (packed[2 + i / 4] >> (2 * (i % 4))) & 3;
++          dst[b * 64 + i] = (q - 1) * d;
++        }
++      }
++      return true;
+     case core::GgmlType::kQ3_K:
+       DequantizeQ3_K(src, dst, k);
+       return true;
+diff --git a/src/core/quant/ggml_dequant.hpp b/src/core/quant/ggml_dequant.hpp
+index 893ba9c..625ca27 100644
+--- a/src/core/quant/ggml_dequant.hpp
++++ b/src/core/quant/ggml_dequant.hpp
+@@ -117,6 +117,8 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
+     case core::GgmlType::kQ8_0:
+     case core::GgmlType::kIQ4_NL:
+       return 32;
++    case core::GgmlType::kQ2_0:
++      return 64;
+     case core::GgmlType::kQ2_K:
+     case core::GgmlType::kIQ2_XXS:
+     case core::GgmlType::kIQ2_XS:
+diff --git a/src/models/qwen38_flash_next/extension.cmake b/src/models/qwen38_flash_next/extension.cmake
+index f7ccd47..df53b4b 100644
+--- a/src/models/qwen38_flash_next/extension.cmake
++++ b/src/models/qwen38_flash_next/extension.cmake
+@@ -62,7 +62,7 @@ if (ENGINE_ENABLE_HIP)
+   target_compile_definitions(gufo_qwen38_flash_next_mmq PRIVATE
+     GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
+   target_compile_options(gufo_qwen38_flash_next_mmq PRIVATE
+-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
++    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
+   target_link_libraries(gufo_qwen38_flash_next_mmq PUBLIC hip::host roc::hipblas)
+ endif()
+@@ -107,7 +107,7 @@ if(TARGET gufo_qwen38_flash_next_hip)
+   target_compile_definitions(gufo_qwen38_flash_next_hip PRIVATE QFN_ROCM_BUILD=1)
+   target_compile_options(gufo_qwen38_flash_next_hip PRIVATE
+     $<$<COMPILE_LANGUAGE:CXX>:-O2>
+-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
++    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
+   target_include_directories(gufo_qwen38_flash_next_hip SYSTEM PUBLIC
+     ${HIPCUB_INCLUDE_DIR}
+     ${ROCPRIM_INCLUDE_DIR}
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp b/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
+index 319907c..b9f7cc2 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/device_model.cpp
+@@ -28,8 +28,7 @@ struct Conversion {
+   void* source;
+   void* destination;
+   std::size_t count;
+-  /// Expands Q8_0 weights to F32 instead of narrowing F32 to F16.
+-  bool expand_q8{false};
++  UploadConversion kind;
+   std::size_t source_bytes{0};
+ };
+ 
+@@ -75,7 +74,7 @@ struct Uploader {
+     return weights->Allocate(pointer, size);
+   }
+ 
+-  DeviceTensor Copy(const TensorRef& t) {
++  DeviceTensor CopyPacked(const TensorRef& t) {
+     DeviceTensor d;
+     if (t.empty() || !ok) {
+       return d;
+@@ -113,6 +112,45 @@ struct Uploader {
+     return d;
+   }
+ 
++  DeviceTensor Copy(const TensorRef& t) {
++    using core::GgmlType;
++    DeviceTensor d = CopyPacked(t);
++    if (!ok || t.empty())
++      return d;
++    UploadConversion kind;
++    GgmlType target = GgmlType::kF16;
++    if (t.type == GgmlType::kQ2_0) {
++      kind = UploadConversion::kExpertQ2;
++      target = GgmlType::kQ8_0;
++    } else if (t.experts == 1 && t.type == GgmlType::kIQ4_XS) {
++      kind = UploadConversion::kEmbedIQ4;
++    } else if (t.experts == 1 && t.type == GgmlType::kQ6_K) {
++      kind = UploadConversion::kDenseQ6;
++    } else {
++      return d;
++    }
++    const std::size_t count = t.ElementCount();
++    const std::size_t size =
++        target == GgmlType::kQ8_0 ? count / 32 * 34 : count * 2;
++    void* dst = nullptr;
++    if (Allocate(&dst, size + kTailMargin) != hipSuccess) {
++      Fail("device allocation failed for " + std::string(t.name));
++      return {};
++    }
++    if (Measuring())
++      return {};
++    allocations.push_back(dst);
++    bytes += size + kTailMargin;
++    conversions.push_back({d.data, dst, count, kind, t.SizeBytes()});
++    (void)hipMemsetAsync(static_cast<std::uint8_t*>(dst) + size, 0, kTailMargin,
++                         nullptr);
++    d.data = dst;
++    d.type = target;
++    if (target == GgmlType::kF16)
++      max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
++    return d;
++  }
++
+   /// Uploads a narrow projection the quantized tier does not cover (the
+   /// hyper-connection inject) as F32. A Q8_0 tensor is uploaded as is and
+   /// expanded once the disk pipeline drains, so it runs the F32 kernels with
+@@ -143,7 +181,8 @@ struct Uploader {
+     }
+     allocations.push_back(f32);
+     bytes += count * sizeof(float) + kTailMargin;
+-    conversions.push_back({d.data, f32, count, true, t.SizeBytes()});
++    conversions.push_back(
++        {d.data, f32, count, UploadConversion::kExpandQ8, t.SizeBytes()});
+     (void)hipMemsetAsync(static_cast<std::uint8_t*>(f32) + count * 4, 0,
+                          kTailMargin, nullptr);
+     d.data = f32;
+@@ -292,7 +331,8 @@ struct Uploader {
+       if (!Measuring()) {
+         allocations.push_back(f32);
+         bytes += f32_bytes + kTailMargin;
+-        conversions.push_back({ptr, f32, elements, true, size});
++        conversions.push_back(
++            {ptr, f32, elements, UploadConversion::kExpandQ8, size});
+       }
+     }
+     const std::size_t count = f32_bytes / sizeof(float);
+@@ -309,7 +349,8 @@ struct Uploader {
+     bytes += count * sizeof(std::uint16_t) + kTailMargin;
+     // Keep the small F32 stacks until the disk pipeline drains. Converting
+     // each router immediately would serialize every layer's uploads.
+-    conversions.push_back({f32, half, count, false, f32_bytes});
++    conversions.push_back(
++        {f32, half, count, UploadConversion::kNarrowF32, f32_bytes});
+     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
+                          kTailMargin, nullptr);
+     d.data = half;
+@@ -487,8 +528,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
+     return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
+            supported(l.ffn_down_exps);
+   };
+-  if (!supported(w.token_embd) || !supported(w.output) ||
+-      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
++  if (!std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
+       (mtp != nullptr && !layer_supported(mtp->block))) {
+     return nullptr;
+   }
+@@ -538,18 +578,22 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
+   assert(up.requested == measured);
+   m->token_embd_ = uploaded.token_embd;
+   m->output_ = uploaded.output;
+-  m->output_bytes_ = w.output.SizeBytes();
++  m->output_bytes_ = m->output_.type == core::GgmlType::kF16
++                         ? w.output.ElementCount() * 2
++                         : w.output.SizeBytes();
+   m->hc_head_ = uploaded.hc_head;
+   m->layers_ = std::move(uploaded.layers);
+   m->mtp_ = uploaded.mtp;
+   m->has_mtp_ = mtp != nullptr;
+   for (const auto& c : conversions) {
+-    if (c.expand_q8) {
++    if (c.kind == UploadConversion::kExpandQ8) {
+       ExpandQ8_0(c.source, static_cast<float*>(c.destination), c.count,
+                  nullptr);
+-    } else {
++    } else if (c.kind == UploadConversion::kNarrowF32) {
+       NarrowActivations(static_cast<const float*>(c.source), c.destination,
+                         false, c.count, nullptr);
++    } else {
++      ConvertMixedWeights(c.kind, c.source, c.destination, c.count, nullptr);
+     }
+   }
+   const auto status = hipDeviceSynchronize();
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+index 490fad8..d3e6a8f 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+@@ -2213,6 +2213,8 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
+         rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+         break;
+       default:
++        rc = qfn_mmq_mixed_moe_raw(static_cast<int>(w.type), w.data, x, ids,
++                                   out, M, K, T, E, U, stream_);
+         break;
+     }
+   }
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp b/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+index 35a553a..45279ab 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+@@ -1324,6 +1324,53 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
+   }
+ }
+ 
++template<UploadConversion conversion>
++__global__ void ConvertMixedWeightsKernel(const std::uint8_t* src, void* dst,
++                                          std::size_t count) {
++  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
++  if (i >= count)
++    return;
++  if constexpr (conversion == UploadConversion::kExpertQ2) {
++    // Each input block shares one FP16 scale across 64 two-bit codes.
++    const auto* block = src + (i / 64) * 18;
++    auto* q8 = static_cast<std::uint8_t*>(dst) + (i / 32) * 34;
++    if ((i % 32) == 0)
++      *reinterpret_cast<std::uint16_t*>(q8) =
++          *reinterpret_cast<const std::uint16_t*>(block);
++    const unsigned code = (block[2 + (i % 64) / 4] >> (2 * (i % 4))) & 3;
++    reinterpret_cast<std::int8_t*>(q8 + 2)[i % 32] = static_cast<int>(code) - 1;
++  } else {
++    const unsigned j = i % 256;
++    float weight;
++    if constexpr (conversion == UploadConversion::kDenseQ6) {
++      const auto* block = src + (i / 256) * 210;
++      const unsigned half = j / 128, lane = j % 32, segment = (j / 32) % 4;
++      const unsigned lo = (block[half * 64 + (segment % 2) * 32 + lane] >>
++                           (4 * (segment / 2))) &
++                          15;
++      const unsigned hi = (block[128 + half * 32 + lane] >> (2 * segment)) & 3;
++      const int scale =
++          reinterpret_cast<const std::int8_t*>(block + 192)[j / 16];
++      weight = __half2float(*reinterpret_cast<const __half*>(block + 208)) *
++               scale * (static_cast<int>(lo | (hi << 4)) - 32);
++    } else {
++      constexpr std::int8_t values[] = {-127, -104, -83, -65, -49, -35,
++                                        -22,  -10,  1,   13,  25,  38,
++                                        53,   69,   89,  113};
++      const auto* block = src + (i / 256) * 136;
++      const unsigned g = j / 32;
++      const unsigned lo = (block[4 + g / 2] >> (4 * (g % 2))) & 15;
++      const unsigned hi =
++          (*reinterpret_cast<const std::uint16_t*>(block + 2) >> (2 * g)) & 3;
++      const unsigned code =
++          (block[8 + g * 16 + j % 16] >> (4 * ((j / 16) % 2))) & 15;
++      weight = __half2float(*reinterpret_cast<const __half*>(block)) *
++               (static_cast<int>(lo | (hi << 4)) - 32) * values[code];
++    }
++    static_cast<__half*>(dst)[i] = __float2half_rn(weight);
++  }
++}
++
+ __global__ void ExpandQ8_0Kernel(const std::uint8_t* q8, float* out,
+                                  std::size_t count) {
+   const std::size_t i =
+@@ -7280,6 +7327,27 @@ void ExpandQ8_0(const void* q8, float* out, std::size_t count,
+                      stream, static_cast<const std::uint8_t*>(q8), out, count);
+ }
+ 
++void ConvertMixedWeights(UploadConversion conversion, const void* src,
++                         void* dst, std::size_t count, hipStream_t stream) {
++  const auto* bytes = static_cast<const std::uint8_t*>(src);
++  switch (conversion) {
++    case UploadConversion::kDenseQ6:
++      ConvertMixedWeightsKernel<UploadConversion::kDenseQ6>
++          <<<Blocks(count), kThreads, 0, stream>>>(bytes, dst, count);
++      break;
++    case UploadConversion::kEmbedIQ4:
++      ConvertMixedWeightsKernel<UploadConversion::kEmbedIQ4>
++          <<<Blocks(count), kThreads, 0, stream>>>(bytes, dst, count);
++      break;
++    case UploadConversion::kExpertQ2:
++      ConvertMixedWeightsKernel<UploadConversion::kExpertQ2>
++          <<<Blocks(count), kThreads, 0, stream>>>(bytes, dst, count);
++      break;
++    default:
++      throw std::invalid_argument("invalid mixed weight conversion");
++  }
++}
++
+ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
+                        hipStream_t stream) {
+   if (bf16) {
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp b/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+index 0e74b9e..d0d96b1 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+@@ -220,6 +220,15 @@ void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
+ /// Expands `count` Q8_0 weights (whole 32-element blocks) to F32.
+ void ExpandQ8_0(const void* q8, float* out, std::size_t count,
+                 hipStream_t stream);
++enum class UploadConversion {
++  kNarrowF32,
++  kExpandQ8,
++  kDenseQ6,
++  kEmbedIQ4,
++  kExpertQ2
++};
++void ConvertMixedWeights(UploadConversion conversion, const void* src,
++                         void* dst, std::size_t count, hipStream_t stream);
+ 
+ /// W8A8 route for wide batches over Q8_0 weights: activations quantized per
+ /// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp b/src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp
+index 6b711fb..02c33a4 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/mmq/mmvq.hip.cpp
+@@ -229,6 +229,11 @@ typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1
+ static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
++        case GGML_TYPE_Q5_0: return vec_dot_q5_0_q8_1;
++        case GGML_TYPE_IQ2_S: return vec_dot_iq2_s_q8_1;
++        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
++        case GGML_TYPE_IQ4_NL: return vec_dot_iq4_nl_q8_1;
++        case GGML_TYPE_IQ4_XS: return vec_dot_iq4_xs_q8_1;
+         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+@@ -239,6 +244,11 @@ static constexpr __device__ vec_dot_q_hip_t get_vec_dot_q_hip(ggml_type type) {
+ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+     switch (type) {
+         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
++        case GGML_TYPE_Q5_0: return VDR_Q5_0_Q8_1_MMVQ;
++        case GGML_TYPE_IQ2_S: return VDR_IQ2_S_Q8_1_MMVQ;
++        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
++        case GGML_TYPE_IQ4_NL: return VDR_IQ4_NL_Q8_1_MMVQ;
++        case GGML_TYPE_IQ4_XS: return VDR_IQ4_XS_Q8_1_MMVQ;
+         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+         case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+@@ -833,6 +843,26 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
+             launch_moe<GGML_TYPE_Q5_K>(weights, input, ids, output, k, rows, tokens,
+                                           experts_used, input_stride, stream);
+             break;
++        case GGML_TYPE_Q5_0:
++            launch_moe<GGML_TYPE_Q5_0>(weights, input, ids, output, k, rows, tokens,
++                                          experts_used, input_stride, stream);
++            break;
++        case GGML_TYPE_IQ2_S:
++            launch_moe<GGML_TYPE_IQ2_S>(weights, input, ids, output, k, rows, tokens,
++                                          experts_used, input_stride, stream);
++            break;
++        case GGML_TYPE_IQ3_XXS:
++            launch_moe<GGML_TYPE_IQ3_XXS>(weights, input, ids, output, k, rows, tokens,
++                                          experts_used, input_stride, stream);
++            break;
++        case GGML_TYPE_IQ4_NL:
++            launch_moe<GGML_TYPE_IQ4_NL>(weights, input, ids, output, k, rows, tokens,
++                                          experts_used, input_stride, stream);
++            break;
++        case GGML_TYPE_IQ4_XS:
++            launch_moe<GGML_TYPE_IQ4_XS>(weights, input, ids, output, k, rows, tokens,
++                                          experts_used, input_stride, stream);
++            break;
+         default: GGML_ABORT("unsupported vector weight format");
+     }
+ }
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h b/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h
+index 87fc6c1..b647424 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h
++++ b/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h
+@@ -80,6 +80,10 @@ int qfn_mmq_q4_K_moe_raw(
+     int M, int K, int n_tokens, int n_experts, int n_expert_used,
+     hipStream_t stream);
+ 
++int qfn_mmq_mixed_moe_raw(
++    int type, const void *W, const float *X, const int32_t *ids, float *out,
++    int M, int K, int n_tokens, int n_experts, int n_used, hipStream_t stream);
++
+ int qfn_mmq_q5_1_moe_raw(
+     const void * W, const float * X_f32, const int32_t * ids, float * out,
+     int M, int K, int n_tokens, int n_experts, int n_expert_used,
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp b/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp
+index 5a63966..041f29b 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.hip.cpp
+@@ -359,7 +359,10 @@ static int moe_vector_projection(int weight_type, const void* W,
+   constexpr const char* tag = "qfn_mmq_moe_vec";
+   const auto type = static_cast<ggml_type>(weight_type);
+   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
+-      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0) {
++      type != GGML_TYPE_Q5_1 && type != GGML_TYPE_Q8_0 &&
++      type != GGML_TYPE_Q5_0 && type != GGML_TYPE_IQ2_S &&
++      type != GGML_TYPE_IQ3_XXS && type != GGML_TYPE_IQ4_NL &&
++      type != GGML_TYPE_IQ4_XS) {
+     fprintf(stderr, "%s: unsupported weight type %d\n", tag, weight_type);
+     return -1;
+   }
+@@ -547,6 +550,22 @@ extern "C" int qfn_mmq_q4_K_moe_raw(
+                                             nullptr, nullptr);
+ }
+ 
++extern "C" int qfn_mmq_mixed_moe_raw(
++        int type, const void *W, const float *X, const int32_t *ids, float *out,
++        int M, int K, int n_tokens, int n_experts, int n_used, hipStream_t stream) {
++    decltype(&qfn_mmq_moe_impl<GGML_TYPE_Q5_0>) kernel;
++    switch (type) {
++        case GGML_TYPE_Q5_0: kernel = qfn_mmq_moe_impl<GGML_TYPE_Q5_0>; break;
++        case GGML_TYPE_IQ2_S: kernel = qfn_mmq_moe_impl<GGML_TYPE_IQ2_S>; break;
++        case GGML_TYPE_IQ3_XXS: kernel = qfn_mmq_moe_impl<GGML_TYPE_IQ3_XXS>; break;
++        case GGML_TYPE_IQ4_NL: kernel = qfn_mmq_moe_impl<GGML_TYPE_IQ4_NL>; break;
++        case GGML_TYPE_IQ4_XS: kernel = qfn_mmq_moe_impl<GGML_TYPE_IQ4_XS>; break;
++        default: return -1;
++    }
++    return kernel("qfn_mmq_mixed_moe_raw", W, X, ids, out, M, K, n_tokens,
++                  n_experts, n_used, stream, nullptr, nullptr);
++}
++
+ extern "C" int qfn_mmq_q5_1_moe_raw(
+         const void * W, const float * X, const int32_t * ids, float * out,
+         int M, int K, int n_tokens, int n_experts, int n_expert_used,
+@@ -730,4 +749,9 @@ template void mul_mat_q_case<GGML_TYPE_Q5_1>(
+     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
+ template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+     ggml_backend_hip_context&, const mmq_args&, hipStream_t);
++DECL_MMQ_CASE(GGML_TYPE_Q5_0);
++DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
++DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
++DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
++DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+ } // namespace qfn_mmq
+diff --git a/src/models/qwen38_flash_next/probe.cpp b/src/models/qwen38_flash_next/probe.cpp
+index 1f53487..40d11a4 100644
+--- a/src/models/qwen38_flash_next/probe.cpp
++++ b/src/models/qwen38_flash_next/probe.cpp
+@@ -23,9 +23,11 @@ bool ProbeFlashNextGguf(const core::GgufReader& reader) {
+   const auto trunk_layers = *block_count - nextn_layers;
+   // Check only canonical weights bound by ModelWeights::Bind. Appended MTP
+   // layers and unrelated tensors are not loaded as part of the trunk.
+-  static constexpr std::array<core::GgmlType, 5> kExpertFormats = {
+-      core::GgmlType::kQ4_K, core::GgmlType::kQ5_K, core::GgmlType::kQ6_K,
+-      core::GgmlType::kQ5_1, core::GgmlType::kQ8_0};
++  static constexpr std::array<core::GgmlType, 11> kExpertFormats = {
++      core::GgmlType::kQ4_K,   core::GgmlType::kQ5_K,  core::GgmlType::kQ6_K,
++      core::GgmlType::kQ5_1,   core::GgmlType::kQ8_0,  core::GgmlType::kQ2_0,
++      core::GgmlType::kQ5_0,   core::GgmlType::kIQ2_S, core::GgmlType::kIQ3_XXS,
++      core::GgmlType::kIQ4_NL, core::GgmlType::kIQ4_XS};
+   for (const auto& tensor : reader.GetTensors()) {
+     auto name = tensor.name;
+     if (!name.starts_with("blk.")) {
+diff --git a/src/models/qwen38_flash_next/weights.cpp b/src/models/qwen38_flash_next/weights.cpp
+index 25e98bd..ea03e5e 100644
+--- a/src/models/qwen38_flash_next/weights.cpp
++++ b/src/models/qwen38_flash_next/weights.cpp
+@@ -23,6 +23,16 @@ struct Format {
+     case GgmlType::kF16:
+     case GgmlType::kBF16:
+       return {1, 2};
++    case GgmlType::kQ2_0:
++      return {64, 18};
++    case GgmlType::kQ5_0:
++      return {32, 22};
++    case GgmlType::kIQ2_S:
++      return {256, 82};
++    case GgmlType::kIQ3_XXS:
++      return {256, 98};
++    case GgmlType::kIQ4_XS:
++      return {256, 136};
+     case GgmlType::kQ8_0:
+       return {32, 34};
+     case GgmlType::kQ5_1:
+@@ -138,10 +148,13 @@ struct Binder {
+     const std::string p = "blk." + std::to_string(il) + ".";
+     const std::uint64_t hidden = c.hidden_size;
+     const std::uint64_t hc_dim = c.HcDim();
+-    const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
+-                        GgmlType::kF32};
+-    const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
+-                          GgmlType::kQ5_1, GgmlType::kQ8_0};
++    const auto dense = {GgmlType::kQ8_0, GgmlType::kQ6_K, GgmlType::kBF16,
++                        GgmlType::kF16, GgmlType::kF32};
++    const auto experts = {
++        GgmlType::kQ4_K,   GgmlType::kQ5_K,  GgmlType::kQ6_K,
++        GgmlType::kQ5_1,   GgmlType::kQ8_0,  GgmlType::kQ2_0,
++        GgmlType::kQ5_0,   GgmlType::kIQ2_S, GgmlType::kIQ3_XXS,
++        GgmlType::kIQ4_NL, GgmlType::kIQ4_XS};
+ 
+     l.hc_attn = Mixer(p + "hc_attn", c, true);
+     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
+@@ -260,8 +273,9 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
+     }
+     w.config.vocab_size = static_cast<std::uint32_t>(info->dimensions[1]);
+   }
+-  w.token_embd =
+-      b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
++  w.token_embd = b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1,
++                       {GgmlType::kIQ4_XS, GgmlType::kQ8_0, GgmlType::kQ6_K,
++                        GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+   w.output =
+       b.Get("output.weight", c.hidden_size, c.vocab_size, 1, dense, false);
+   if (w.output.empty()) {
+diff --git a/tests/models/qwen38_flash_next/probe_test.cpp b/tests/models/qwen38_flash_next/probe_test.cpp
+index ef220b5..fd1e2df 100644
+--- a/tests/models/qwen38_flash_next/probe_test.cpp
++++ b/tests/models/qwen38_flash_next/probe_test.cpp
+@@ -72,13 +72,14 @@ bool Probe(const std::vector<Tensor>& tensors,
+ void CheckExpertFormats() {
+   for (const auto* role : {"gate", "up", "down"}) {
+     const auto name = std::string("blk.47.ffn_") + role + "_exps.weight";
+-    for (const auto type : {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
+-                            GgmlType::kQ5_1, GgmlType::kQ8_0}) {
++    for (const auto type :
++         {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K, GgmlType::kQ5_1,
++          GgmlType::kQ8_0, GgmlType::kQ2_0, GgmlType::kQ5_0, GgmlType::kIQ2_S,
++          GgmlType::kIQ3_XXS, GgmlType::kIQ4_XS, GgmlType::kIQ4_NL}) {
+       Require(Probe({{name, type}}), "supported expert format declined");
+     }
+     for (const auto type :
+-         {GgmlType::kIQ3_S, GgmlType::kIQ4_XS, GgmlType::kIQ4_NL,
+-          GgmlType::kF16, GgmlType::kQ2_K}) {
++         {GgmlType::kIQ3_S, GgmlType::kF16, GgmlType::kQ2_K}) {
+       Require(!Probe({{name, type}}), "unsupported trunk expert claimed");
+     }
+   }
+@@ -101,7 +102,7 @@ void CheckIgnoredTensors() {
+         "blk.0.ffn_gate_exps.weight.extra", "blk.0.extra.ffn_gate_exps.weight",
+         "per_layer_token_embd.weight"}) {
+     auto tensors = trunk;
+-    tensors.emplace_back(name, GgmlType::kIQ4_NL);
++    tensors.emplace_back(name, GgmlType::kIQ3_S);
+     Require(Probe(tensors), "unused tensor incorrectly declined the trunk");
+   }
+   Require(Probe({{"blk.47.ffn_up_exps.weight", GgmlType::kIQ3_S}}, 48, 1),
