@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import zipfile
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROFILES = ["Q4_K_XL", "IQ4_XS", "Q3_K_XL"]
 
 

@@ -63,6 +63,23 @@
       "draft_accepted": 31,
       "body_text_target": 262000,
       "seed": 73331
+    },
+    {
+      "engine": "1.2.0",
+      "target_and_draft_kv": "q8_0",
+      "sessions": 4,
+      "shared_context": true,
+      "logical_batch": 4096,
+      "physical_batch": 4096,
+      "input_tokens": 262033,
+      "cached_tokens": 0,
+      "output_tokens": 42,
+      "prefill_tps": 847.4433825112991,
+      "decode_tps_gufo": 44.838194968001545,
+      "retrieved": true,
+      "draft_proposed": 40,
+      "draft_accepted": 32,
+      "seed": 23317
     }
   ],
   "hermes": [
@@ -123,6 +140,36 @@
           "cached_tokens": 4196,
           "prefill_tps": 431.3,
           "decode_tps": 43.6
+        }
+      ]
+    },
+    {
+      "engine": "1.2.0",
+      "task": "six congruences, second fixture",
+      "sessions": 4,
+      "tool_names": [
+        "read_file"
+      ],
+      "tool_ids_match": true,
+      "reasoning_tokens": 4123,
+      "correct_final_result": true,
+      "passed": true,
+      "requests": [
+        {
+          "prompt_tokens": 4208,
+          "generated_tokens": 182,
+          "prefill_tokens": 4208,
+          "cached_tokens": 0,
+          "decode_tps": 30.2,
+          "prefill_tps": 583.4
+        },
+        {
+          "prompt_tokens": 4520,
+          "generated_tokens": 5196,
+          "prefill_tokens": 320,
+          "cached_tokens": 4200,
+          "decode_tps": 42.8,
+          "prefill_tps": 512.3
         }
       ]
     }
@@ -237,6 +284,40 @@
       "peak_system_pagefile_used_gib": 1.33,
       "peak_wddm_dedicated_gib": 62.27,
       "peak_wddm_shared_gib": 23.93
+    }
+  ],
+  "matched_q3_memory": [
+    {
+      "engine": "1.2.0",
+      "sessions": 4,
+      "n_ctx": 262144,
+      "target_and_draft_kv": "q8_0",
+      "mtp": true,
+      "unified": false,
+      "batch": 2048,
+      "ubatch": 512,
+      "baseline_commit_gib": 27.95,
+      "peak_system_commit_gib": 115.54,
+      "peak_private_process_gib": 23.19,
+      "peak_shared_wddm_gib": 23.63,
+      "peak_dedicated_wddm_gib": 62.7,
+      "peak_system_pagefile_gib": 1.33
+    },
+    {
+      "engine": "1.2.0",
+      "sessions": 4,
+      "n_ctx": 262144,
+      "target_and_draft_kv": "q8_0",
+      "mtp": true,
+      "unified": true,
+      "batch": 2048,
+      "ubatch": 512,
+      "baseline_commit_gib": 28.04,
+      "peak_system_commit_gib": 101.64,
+      "peak_private_process_gib": 9.29,
+      "peak_shared_wddm_gib": 9.86,
+      "peak_dedicated_wddm_gib": 62.67,
+      "peak_system_pagefile_gib": 1.33
     }
   ]
 }

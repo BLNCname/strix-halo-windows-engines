@@ -14,15 +14,15 @@ The loader dispatches by tensor type. Both mixed profiles retain 142 packed expe
 
 ### Attention cache in v1.1.0
 
-The target and MTP head store K and V in real GGML Q8_0, Q4_0 or FP16 rows. The manager defaults to Q8_0 for both. For direct Gufo invocation set `GUFO_FLASH_CACHE_K` and `GUFO_FLASH_CACHE_V` to `q8_0`, `q4_0` or `f16`. The draft inherits both values. Optional overrides are `GUFO_FLASH_DRAFT_CACHE_K` and `GUFO_FLASH_DRAFT_CACHE_V`. A direct invocation with no format settings retains FP16. The loader prints all four resolved formats.
+The target and MTP head store K and V in real GGML Q8_0, Q4_0 or FP16 rows. For direct Gufo invocation set `GUFO_FLASH_CACHE_K` and `GUFO_FLASH_CACHE_V` to `q8_0`, `q4_0` or `f16`. The draft inherits both values. Optional overrides are `GUFO_FLASH_DRAFT_CACHE_K` and `GUFO_FLASH_DRAFT_CACHE_V`. A direct invocation with no format settings retains FP16. The loader prints all four resolved formats.
 
 Each group of 32 values uses 34 bytes in Q8_0 or 18 bytes in Q4_0. The FP16 representation takes 64 bytes. Narrow attention reads packed rows directly. Wide prefill uses one FP16 work buffer per quantized side shared by all layers and sessions. Both saved continuation data and admission checks account for the selected row layout. Recurrent state and the sparse index use their model-specific types.
 
 On a 128 GiB Radeon 8060S system, a Q3 load at context 262144 with four sessions and a separate MTP head peaked at 122.33 GiB system commit with FP16 KV and 110.57 GiB with Q8_0 KV. Windows pagefile occupancy was about 1.3 GiB in both runs. For Q4 with the same window and four sessions, FP16 admission required four 7.01 GiB states with only 24.7 GiB available. Q8_0 loaded and served a real Hermes tool request.
 
-### LM Studio launch settings and shared context in v1.2.0
+### Launch arguments and shared context
 
-The open native entry point is `gufo serve lmstudio WORKER_PORT ALIAS -- MODEL_OPTIONS...`. A compatible host passes its complete model-launch argument vector, including one-time overrides, in the original order. The local transport authenticates incoming requests. The native process reports resolved settings and option names under `/props → studio_load`. Engine-native options continue through Gufo's own CLI parser. Unknown options and incompatible values produce a load error. The public generator SDK has a separate model-picker workflow. See the [manager](https://github.com/BLNCname/strix-halo-runtime-manager).
+The open native entry point is `gufo serve lmstudio WORKER_PORT ALIAS -- MODEL_OPTIONS...`. A compatible host passes its complete model-launch argument vector, including one-time overrides, in the original order. A host bridge owns its transport credentials. The standalone server binds to loopback. The native process reports resolved settings and option names under `/props → studio_load`. Engine-native options continue through Gufo's own CLI parser. Unknown options and incompatible values produce a load error.
 
 | Host controls | Native behavior |
 | --- | --- |
@@ -49,7 +49,30 @@ The script fetches the pinned upstream commit, applies the mixed-format patch an
 
 ## Install
 
-The [runtime manager](https://github.com/BLNCname/strix-halo-runtime-manager) installs the release bundle by URL and fetches the matching runtime dependencies from their publishers. The engine package contains the native executable, profile manifest and license notices. Model shards stay where you downloaded them.
+Use a new directory for each version. The Windows x64 executable targets AMD Strix Halo (gfx1151) with a compatible graphics driver. Paths to the runtime, dependencies and model shards are chosen on the destination machine.
+
+1. Download `strix-halo-windows-gfx1151.zip` from [this repository's releases](../../releases). The v1.2.1 asset SHA-256 is `b784d5381e3469f09dbb1f0a0677dffd2ec871f415b377bc19580ec5cbe6dfbd`.
+2. Extract the complete [upstream Gufo v0.35.0 Windows ZIP](https://github.com/gufo-org/gufo/releases/download/v0.35.0/gufo-v0.35.0-windows-x86_64.zip) into the new directory. Its SHA-256 is `32c76bc1b1c6fda10b6786489fa454b42ec06ef19b1a374100ac95203a6dbbb5`. Keep the DLLs, licenses and kernel directories together.
+3. Obtain the following additional DLLs from conda-forge. A `.conda` file is a ZIP containing a `pkg-*.tar.zst` archive. Open that inner archive with a Zstandard-capable archive tool and copy the listed files from `Library/bin/` alongside `gufo.exe`.
+4. Extract this project's ZIP over the new directory, allowing it to replace the upstream executable. The `files` object in `engine.json` gives the SHA-256 for each project payload file. Run `.\gufo.exe --version` in that directory. The v1.2.1 package contains native version `0.35.0-strix.3`.
+5. Download the GGUF shards separately. Keep the files of each quant together and pass its first shard to `--model`. Supply the separate Q8_0 head to enable MTP.
+
+| Package | Files to copy | Package SHA-256 |
+| --- | --- | --- |
+| [ICU 79.1](https://conda.anaconda.org/conda-forge/win-64/icu-79.1-h5112557_0.conda) | `icuuc79.dll`, `icudt79.dll` | `f5ffc5548ff51e7fb8949eca909b919ff465401f8d8a79f5fec1d11f9d27b832` |
+| [libjpeg-turbo 3.2.1](https://conda.anaconda.org/conda-forge/win-64/libjpeg-turbo-3.2.1-hfd05255_0.conda) | `jpeg8.dll` | `195be7b2ff1eeff02b31cf366437a38d84560c2f6c4facd56b2969024f50957f` |
+
+For example, open PowerShell in the runtime directory and set the two paths for your installation.
+
+```powershell
+$firstShard = Read-Host 'Path to the first Flash-Next GGUF shard'
+$mtpHead = Read-Host 'Path to the Q8_0 MTP head'
+$env:GUFO_FLASH_CACHE_K = 'q8_0'
+$env:GUFO_FLASH_CACHE_V = 'q8_0'
+.\gufo.exe serve llm --host 127.0.0.1 --port 8080 --context 262144 --sessions 1 --model $firstShard --speculative mtp --mtp-model $mtpHead
+```
+
+For autoregressive generation, omit the speculative arguments. To give four sessions one shared window, use `.\gufo.exe serve lmstudio 8080 flash-next -- --model $firstShard --ctx-size 262144 --parallel 4 --kv-unified --cache-type-k q8_0 --cache-type-v q8_0 --spec-type mtp --spec-draft-model $mtpHead`. Models can stay in their original directories. Rollback consists of stopping this process and launching the executable from the previous, complete runtime directory.
 
 The project additions and Gufo are MIT licensed. Gufo's notices cover its incorporated components, including ggml (MIT) and Rust crates. Its unmodified Symphonia crates use MPL-2.0. Their exact versions and checksums are recorded in [the upstream Cargo.lock](https://github.com/gufo-org/gufo/blob/v0.35.0/Cargo.lock), and sources are available from [crates.io](https://crates.io/crates/symphonia). Full third-party texts accompany the release. Peonist publishes the HaloGen container under its [own EULA](https://github.com/peonist-ai/halogen-flash-server/blob/main/LICENSE.md).
 
@@ -63,6 +86,10 @@ For Q3_K_XL and IQ4_XS, release-library GPU projections were compared with indep
 
 Two Q8_0 KV runs on v1.1.0 with one session and native prefill sizing processed 262067 and 262084 new tokens at 851.5 and 881.9 tokens/s (arithmetic mean **866.7**). A separate v1.2.0 run honoring the host's physical microbatch of 512 used the four-slot shared pool and reached **561.2 prefill tokens/s** on 261998 new tokens. Its 40-token response decoded at 48.4 tokens/s with 31 of 34 proposals accepted. These are single-request rates. [Machine-readable measurements](measurements.json)
 
+With the released executable, a shared 262144-token window and a 4096-token microbatch, a cold 262033-token request reached **847.4 prefill tokens/s**. The 42-token retrieval answer decoded at 44.8 tokens/s with 32 of 40 MTP proposals accepted. A separate tool-use run verified 4123 reasoning tokens across two requests. The longer response generated 5196 tokens at **42.8 tokens/s**. Its actual prompt was 4520 tokens with 4200 cached.
+
+In matched four-session Q3 loads (262144 tokens, Q8_0 K/V, separate MTP, identical batch settings), peak private process memory was **23.19 GiB** with separate windows and **9.29 GiB** with one shared pool. The executable returned its mapped KV backing to zero after the full-context request completed.
+
 ## Check the kernels and package
 
 In the prepared Windows developer environment, run `tests/build-test-dll.ps1 -Work .build -Destination .build/check`. This links the actual release kernel libraries to test exports. Run the following command for the first Q3 or IQ4 shard with NumPy installed. The CPU reference directory must contain an independently built ggml-base.dll exporting the relevant dequantizers, including dequantize_row_q2_0.
@@ -72,6 +99,6 @@ python tests/mixed_rows.py FIRST_SHARD .build/check/mixed-test.dll GUFO_RUNTIME 
 python package.py .build/build/gufo.exe .build/gufo dist/strix-halo-windows-gfx1151.zip
 ```
 
-The official release executable was built with TheRock 10.0.0, MSVC 14.44 headers and libraries, the Windows 10.0.26100 SDK, clang-cl/lld, Rust 1.88, ICU 79.1 and libjpeg-turbo 3.2.1. Alternative dependency toolchains can change which DLLs a local build needs. The manager's release dependency set matches the published executable.
+The official release executable was built with TheRock 10.0.0, MSVC 14.44 headers and libraries, the Windows 10.0.26100 SDK, clang-cl/lld, Rust 1.88, ICU 79.1 and libjpeg-turbo 3.2.1. Alternative dependency toolchains can change which DLLs a local build needs. The dependency versions used by the published executable are listed under Install.
 
 Run `python tests/kv_rows.py GUFO_RUNTIME GGML_REFERENCE .build/check/mixed-test.dll` for the KV codec comparison. It checks a nonzero row offset, untouched boundary rows, the packed codes, and expansion against ggml. Q8_0 picks the code farther from zero on exact mathematical midpoints. A float32 reciprocal in the CPU reference can choose the equally near code on the other side.
