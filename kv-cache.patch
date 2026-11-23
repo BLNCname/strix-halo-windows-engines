@@ -1,0 +1,725 @@
+diff --git a/src/models/qwen38_flash_next/continuation_adapter.cpp b/src/models/qwen38_flash_next/continuation_adapter.cpp
+index 20de3e4..fb282f1 100644
+--- a/src/models/qwen38_flash_next/continuation_adapter.cpp
++++ b/src/models/qwen38_flash_next/continuation_adapter.cpp
+@@ -751,7 +751,8 @@ void ContinuationAdapter::CopyNativeKeys(
+   const auto copy = [&](__half* destination) {
+     model_->executor_->CopyNativeKeys(
+         native, rows, static_cast<std::uint32_t>(first),
+-        static_cast<std::uint32_t>(end - first), Pool(component.part), rope,
++        static_cast<std::uint32_t>(end - first), Pool(component.part),
++        Pool(component.part) ? KvType::F16 : (draft ? FlashKvFormats().draft.k : FlashKvFormats().target.k), rope,
+         destination, stream);
+   };
+   void* mapped{};
+diff --git a/src/models/qwen38_flash_next/continuation_identity.cpp b/src/models/qwen38_flash_next/continuation_identity.cpp
+index c11a78b..8c1b97a 100644
+--- a/src/models/qwen38_flash_next/continuation_identity.cpp
++++ b/src/models/qwen38_flash_next/continuation_identity.cpp
+@@ -1,3 +1,5 @@
++#include "src/models/qwen38_flash_next/kv_format.hpp"
++
+ #include "src/models/qwen38_flash_next/continuation_identity.hpp"
+ 
+ #include <algorithm>
+@@ -45,6 +47,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
+            << "context_tokens=" << max_context << '\n'
+            << "position_policy=" << position_policy << '\n'
+            << "adapters=none\n";
++  if (const auto layout = KvFormatId(has_mtp)) identity << "kv_formats=" << layout << '\n';
+   if (has_mtp) {
+     identity << "draft_backend=qfn-mtp-v1\n"
+              << "draft_artifact_id=" << ext::kGgufIdentityScheme << ':'
+@@ -66,6 +69,7 @@ std::vector<std::uint8_t> QwenFlashNextProcessIdentity(
+            << "mtp=" << use_mtp << '\n'
+            << "draft_max_tokens=" << max_draft_tokens << '\n'
+            << "draft_cost_concurrency=" << decode_concurrency << '\n';
++  if (const auto layout = KvFormatId(use_mtp)) identity << "kv_formats=" << layout << '\n';
+   const auto canonical = identity.str();
+   return {canonical.begin(), canonical.end()};
+ }
+diff --git a/src/models/qwen38_flash_next/continuation_layout.cpp b/src/models/qwen38_flash_next/continuation_layout.cpp
+index 41d8e6c..6244b60 100644
+--- a/src/models/qwen38_flash_next/continuation_layout.cpp
++++ b/src/models/qwen38_flash_next/continuation_layout.cpp
+@@ -1,3 +1,5 @@
++#include "src/models/qwen38_flash_next/kv_format.hpp"
++
+ #include "src/models/qwen38_flash_next/continuation_layout.hpp"
+ 
+ #include <algorithm>
+@@ -57,9 +59,9 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
+               sizeof(float),
+           layer);
+     } else {
+-      add(ContinuationPart::kKey, std::size_t{c.AttentionKvDim()} * 2, 0,
++      add(ContinuationPart::kKey, KvRowBytes(FlashKvFormats().target.k, c.AttentionKvDim()), 0,
+           layer);
+-      add(ContinuationPart::kValue, std::size_t{c.AttentionKvDim()} * 2, 0,
++      add(ContinuationPart::kValue, KvRowBytes(FlashKvFormats().target.v, c.AttentionKvDim()), 0,
+           layer);
+       add(ContinuationPart::kPooledKeys, std::size_t{c.indexer_head_dim} * 2, 0,
+           layer);
+@@ -72,8 +74,8 @@ ContinuationLayout::ContinuationLayout(const Config& c, bool mtp,
+     add(ContinuationPart::kPleHistory, 0,
+         std::size_t{c.PleConvHistory()} * c.HcDim() * sizeof(float));
+   if (mtp) {
+-    add(ContinuationPart::kDraftKey, std::size_t{c.AttentionKvDim()} * 2, 0);
+-    add(ContinuationPart::kDraftValue, std::size_t{c.AttentionKvDim()} * 2, 0);
++    add(ContinuationPart::kDraftKey, KvRowBytes(FlashKvFormats().draft.k, c.AttentionKvDim()), 0);
++    add(ContinuationPart::kDraftValue, KvRowBytes(FlashKvFormats().draft.v, c.AttentionKvDim()), 0);
+     add(ContinuationPart::kDraftPooledKeys, std::size_t{c.indexer_head_dim} * 2,
+         0);
+     add(ContinuationPart::kDraftRawKeys, 0,
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/batch.cpp b/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
+index a682bf5..2b10ead 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/batch.cpp
+@@ -327,11 +327,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
+         UseYarn(session);
+         if (!PrepareAttention(
+                 base.qg + std::size_t{offsets[i]} * kv.rows, kv.rows, nullptr,
+-                l.attn_k_norm.f32(), nullptr, nullptr, session.mtp_.k_cache,
+-                session.mtp_.v_cache, n, 0, c.num_kv_heads, c.head_dim,
++                l.attn_k_norm.f32(), nullptr, nullptr,
++                FlashKvFormats().draft.k == KvType::F16 ? session.mtp_.k_cache : key_stage_,
++                FlashKvFormats().draft.v == KvType::F16 ? session.mtp_.v_cache : value_stage_, n, 0, c.num_kv_heads, c.head_dim,
+                 c.rotary_dim, &session.control_->mtp_position, c.rope_theta,
+                 c.rms_eps, stream_, session.vision_input_.rope(), false, yarn_))
+           return Fail(error, "batched MTP cache projection failed");
++        PackCache(key_stage_, session.mtp_.k_cache, FlashKvFormats().draft.k,
++                  c.AttentionKvDim(), n, &session.control_->mtp_position, stream_);
++        PackCache(value_stage_, session.mtp_.v_cache, FlashKvFormats().draft.v,
++                  c.AttentionKvDim(), n, &session.control_->mtp_position, stream_);
+         StoreRows(base.ik + std::size_t{offsets[i]} * c.indexer_head_dim,
+                   session.mtp_.index_k, n, c.indexer_head_dim,
+                   &session.control_->mtp_position, capacity, stream_);
+@@ -375,6 +380,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
+       ++session.mutation_epoch_;
+       session.mtp_.residual_valid = false;
+       Session::AttentionState attention;
++      attention.formats = FlashKvFormats().draft;
+       attention.rope = session.vision_input_.rope();
+       attention.k_cache = session.mtp_.k_cache;
+       attention.v_cache = session.mtp_.v_cache;
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+index d3e6a8f..159f929 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.cpp
+@@ -1,3 +1,4 @@
++#include <cstdio>
+ #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+ 
+ #include <algorithm>
+@@ -1068,6 +1069,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
+   const std::size_t hidden = c.hidden_size;
+   const std::size_t slots = T * c.num_experts_used;
+   auto& a = e->allocations_;
++  const auto& formats = FlashKvFormats();
++  const auto stage_count = size_t(e->context_capacity_) * c.AttentionKvDim();
++  if (formats.target.k != KvType::F16 || formats.draft.k != KvType::F16) {
++    e->key_stage_ = Alloc<__half>(a, stage_count, error_msg);
++    if (!e->key_stage_) return nullptr;
++  }
++  if (formats.target.v != KvType::F16 || formats.draft.v != KvType::F16) {
++    e->value_stage_ = Alloc<__half>(a, stage_count, error_msg);
++    if (!e->value_stage_) return nullptr;
++  }
++  std::fprintf(stderr, "[Flash-Next KV] target K=%s V=%s; draft K=%s V=%s\n",
++               KvName(formats.target.k), KvName(formats.target.v),
++               KvName(formats.draft.k), KvName(formats.draft.v));
+   Scratch& s = e->s_;
+   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
+   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
+@@ -1424,10 +1438,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+     } else {
+       auto& at = s->attention_[il];
+       at.k_cache =
+-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
++          Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().target.k, kv_row) / 2,
+                         error_msg, &s->allocated_bytes_);
+       at.v_cache =
+-          Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
++          Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().target.v, kv_row) / 2,
+                         error_msg, &s->allocated_bytes_);
+       at.index_k = Alloc<float>(
+           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
+@@ -1454,10 +1468,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+                          c.HcDim(),
+                      error_msg, &s->allocated_bytes_);
+     s->mtp_.k_cache =
+-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
++        Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().draft.k, kv_row) / 2,
+                       error_msg, &s->allocated_bytes_);
+     s->mtp_.v_cache =
+-        Alloc<__half>(a, static_cast<std::size_t>(max_context) * kv_row,
++        Alloc<__half>(a, size_t(max_context) * KvRowBytes(FlashKvFormats().draft.v, kv_row) / 2,
+                       error_msg, &s->allocated_bytes_);
+     s->mtp_.index_k =
+         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
+@@ -1702,8 +1716,11 @@ std::size_t Executor::SessionBytes(
+       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
+   const std::size_t ple =
+       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
+-  const std::size_t kv =
+-      2 * std::size_t{max_context} * c.AttentionKvDim() * sizeof(__half);
++  const auto kv_bytes = [&](KvPair pair) {
++    return size_t(max_context) * (KvRowBytes(pair.k, c.AttentionKvDim()) +
++                                  KvRowBytes(pair.v, c.AttentionKvDim()));
++  };
++  const auto& formats = FlashKvFormats();
+   const std::size_t index =
+       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
+           c.indexer_head_dim * sizeof(float) +
+@@ -1722,9 +1739,9 @@ std::size_t Executor::SessionBytes(
+   return ((linear * conv + ple) * (rollback_depth + 1) +
+           linear * (state + rollback_state)) *
+              sizeof(float) +
+-         attention * (kv + index) + sizeof(Session::Control) +
++         attention * (kv_bytes(formats.target) + index) + sizeof(Session::Control) +
+          (mode == core::SessionMode::kSpeculative
+-              ? kv + index + hidden_rows * c.HcDim() * sizeof(float) +
++              ? kv_bytes(formats.draft) + index + hidden_rows * c.HcDim() * sizeof(float) +
+                     (model_->draft_output().empty()
+                          ? 0
+                          : std::size_t{speculative::kDraftVocabExtraRows} *
+@@ -1855,11 +1872,17 @@ bool Executor::SetYarnFactor(Session& s, float factor, std::string* error_msg) {
+   }
+   // A prefill checkpoint over these rows is consumed before the next
+   // forward, which this precedes.
++  const auto rotate_cache = [&](const KvType type, __half* cache, unsigned count,
++                                const qwen::vision::DeviceRope* rope) {
++    __half* view = type == KvType::F16 ? cache : key_stage_;
++    ExpandCache(cache, view, type, c.AttentionKvDim(), count, nullptr, stream_);
++    RerotateKeys(view, view, 0, count, c.num_kv_heads, c.head_dim, c.rotary_dim,
++                 1, c.rope_theta, rope, from, to, stream_);
++    PackCache(view, cache, type, c.AttentionKvDim(), count, nullptr, stream_);
++  };
+   for (auto& a : s.attention_) {
+     if (a.k_cache != nullptr && s.position_ != 0)
+-      RerotateKeys(a.k_cache, a.k_cache, 0, s.position_, c.num_kv_heads,
+-                   c.head_dim, c.rotary_dim, 1, c.rope_theta, a.rope, from, to,
+-                   stream_);
++      rotate_cache(a.formats.k, a.k_cache, s.position_, a.rope);
+     if (a.block_k != nullptr && s.blocks_ != 0 && c.compress_ratio != 0)
+       RerotateKeys(a.block_k, a.block_k, 0, s.blocks_, 1, c.indexer_head_dim,
+                    c.rotary_dim, c.compress_ratio, c.rope_theta, a.rope, from,
+@@ -1867,9 +1890,7 @@ bool Executor::SetYarnFactor(Session& s, float factor, std::string* error_msg) {
+   }
+   const auto* mtp_rope = s.vision_input_.rope();
+   if (s.mtp_.k_cache != nullptr && s.mtp_.position != 0)
+-    RerotateKeys(s.mtp_.k_cache, s.mtp_.k_cache, 0, s.mtp_.position,
+-                 c.num_kv_heads, c.head_dim, c.rotary_dim, 1, c.rope_theta,
+-                 mtp_rope, from, to, stream_);
++    rotate_cache(FlashKvFormats().draft.k, s.mtp_.k_cache, s.mtp_.position, mtp_rope);
+   if (s.mtp_.block_k != nullptr && s.mtp_.blocks != 0 && c.compress_ratio != 0)
+     RerotateKeys(s.mtp_.block_k, s.mtp_.block_k, 0, s.mtp_.blocks, 1,
+                  c.indexer_head_dim, c.rotary_dim, c.compress_ratio,
+@@ -1891,11 +1912,27 @@ bool Executor::SetYarnFactor(Session& s, float factor, std::string* error_msg) {
+ 
+ void Executor::CopyNativeKeys(const Session& s, const __half* rows,
+                               std::uint32_t first, std::uint32_t count,
+-                              bool pooled, const qwen::vision::DeviceRope* rope,
++                              bool pooled, KvType format, const qwen::vision::DeviceRope* rope,
+                               __half* destination, hipStream_t stream) const {
+   const Config& c = config();
+   const auto heads = pooled ? 1U : c.num_kv_heads;
+   const auto dim = pooled ? c.indexer_head_dim : c.head_dim;
++  if (format != KvType::F16) {
++    // Snapshot transfers use a separate stream and cannot borrow forward scratch.
++    __half* dense = nullptr;
++    const unsigned width = heads * dim;
++    if (hipMalloc(&dense, size_t(count) * width * sizeof(__half)) != hipSuccess)
++      throw std::runtime_error("packed key capture allocation failed");
++    const auto* start = rows + size_t(first) * KvRowBytes(format, width) / sizeof(__half);
++    ExpandCache(start, dense, format, width, count, nullptr, stream);
++    RerotateKeys(dense, dense, first, count, heads, dim, c.rotary_dim, 1,
++                 c.rope_theta, rope, s.yarn_rope_, YarnRope{}, stream);
++    PackCache(dense, destination, format, width, count, nullptr, stream);
++    const auto status = hipStreamSynchronize(stream);
++    hipFree(dense);
++    if (status != hipSuccess) throw std::runtime_error("packed key capture failed");
++    return;
++  }
+   RerotateKeys(rows + std::size_t{first} * heads * dim, destination, first,
+                count, heads, dim, c.rotary_dim, pooled ? c.compress_ratio : 1,
+                c.rope_theta, rope, s.yarn_rope_, YarnRope{}, stream);
+@@ -2914,6 +2951,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+   const std::uint32_t kv_row = c.AttentionKvDim();
+   const std::uint32_t index_capacity =
+       IndexerCapacity(c, options_.max_batch, max_context);
++  __half* key_view = s.formats.k == KvType::F16 ? s.k_cache : key_stage_;
++  __half* value_view = s.formats.v == KvType::F16 ? s.v_cache : value_stage_;
+   bool prepared = false;
+   if (!l.attn_qkv.empty()) {
+     const bool fused_projection =
+@@ -2927,7 +2966,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+       prepared = AttentionF16Gemm(
+           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
+           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
++          key_view, value_view, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
+           s.rope, yarn_);
+       if (!prepared) {
+         AssignError(error_msg, "fused attention projection failed");
+@@ -2940,7 +2979,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+       }
+       prepared = PrepareAttention(
+           s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
+-          s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
++          s_.q, s_.attn_gate, key_view, value_view, n_tokens, c.num_heads,
+           c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
+           c.rms_eps, stream_, s.rope, prefill_phase, yarn_);
+       if (!prepared) {
+@@ -2969,8 +3008,15 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+          c.rope_theta, stream_, s.rope, yarn_);
+     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
+          c.rope_theta, stream_, s.rope, yarn_);
+-    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
+-    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
++    StoreKv(s_.k, key_view, n_tokens, kv_row, pos, stream_);
++    StoreKv(s_.v, value_view, n_tokens, kv_row, pos, stream_);
++  }
++
++  PackCache(key_view, s.k_cache, s.formats.k, kv_row, n_tokens, pos, stream_);
++  PackCache(value_view, s.v_cache, s.formats.v, kv_row, n_tokens, pos, stream_);
++  if (MatrixRows(n_tokens) || checkpoints.count) {
++    ExpandCache(s.k_cache, key_view, s.formats.k, kv_row, n_tokens, pos, stream_);
++    ExpandCache(s.v_cache, value_view, s.formats.v, kv_row, n_tokens, pos, stream_);
+   }
+ 
+   // Raw keys survive only until pooling. The ring holds the initial
+@@ -3056,16 +3102,16 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+     };
+     return (dense_rows == rows ||
+             WmmaCausalAttention(
+-                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), s.k_cache,
+-                s.v_cache,
++                s_.q + at(dense_rows), s_.attn_gate + at(dense_rows), key_view,
++                value_view,
+                 mask ? mask + std::size_t{first + dense_rows} * mask_words_
+                      : nullptr,
+                 mask_words_, s_.ctx + at(dense_rows), rows - dense_rows,
+                 pos + dense_rows, c.num_heads, c.num_kv_heads, c.head_dim,
+                 c.compress_ratio, stream_, last)) &&
+            (dense_rows == 0 || (last && dense_rows != rows) ||
+-            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), s.k_cache,
+-                                s.v_cache, nullptr, mask_words_, s_.ctx + at(0),
++            WmmaCausalAttention(s_.q + at(0), s_.attn_gate + at(0), key_view,
++                                value_view, nullptr, mask_words_, s_.ctx + at(0),
+                                 dense_rows, pos, c.num_heads, c.num_kv_heads,
+                                 c.head_dim, c.compress_ratio, stream_, last));
+   };
+@@ -3100,7 +3146,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
+                   c.compress_ratio, stream_, split ? s_.attn_lists : nullptr,
+                   split ? s_.attn_counts : nullptr,
+                   c.compress_ratio > 0 ? c.indexer_top_k / c.compress_ratio : 0,
+-                  c.indexer_top_k);
++                  c.indexer_top_k, s.formats);
+   const std::uint32_t q_dim = c.AttentionQDim();
+   const std::size_t ctx_count = static_cast<std::size_t>(n_tokens) * q_dim;
+   // A decode batch's output projection reads the gate's Q8_1 rows.
+@@ -4269,6 +4315,7 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
+                                   const Session& session) {
+   SnapshotHeader h{};
+   h.magic = kSnapshotMagic;
++  h.magic.back() ^= static_cast<char>(KvFormatId(has_mtp));
+   h.num_layers = c.num_layers;
+   h.full_attention_interval = c.full_attention_interval;
+   h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+@@ -4351,8 +4398,9 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
+               std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
+     return 0;
+   }
+-  const std::uint64_t kv_bytes =
+-      std::uint64_t{h.position} * h.kv_row * sizeof(__half);
++  const auto& formats = FlashKvFormats();
++  const std::uint64_t key_row = KvRowBytes(formats.target.k, h.kv_row);
++  const std::uint64_t value_row = KvRowBytes(formats.target.v, h.kv_row);
+   const std::uint64_t index_row_bytes =
+       std::uint64_t{h.indexer_head_dim} * sizeof(float);
+   const std::uint32_t index_begin = h.blocks * h.compress_ratio;
+@@ -4362,10 +4410,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
+   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
+     if (((il + 1) % h.full_attention_interval) == 0) {
+       const auto* at = attention(il);
+-      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache",
+-                  std::uint64_t{h.kv_row} * sizeof(__half)) ||
+-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache",
+-                  std::uint64_t{h.kv_row} * sizeof(__half))) {
++      if (!region(at != nullptr ? at->k_cache : nullptr, h.position * key_row, "K cache", key_row) ||
++          !region(at != nullptr ? at->v_cache : nullptr, h.position * value_row, "V cache", value_row)) {
+         return 0;
+       }
+       // Serialize only unpooled rows, in chronological order. The physical
+@@ -4412,13 +4458,13 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
+             "draft pooled keys",
+             std::uint64_t{h.indexer_head_dim} * sizeof(__half), true, true))
+       return 0;
+-    const std::uint64_t mtp_kv_bytes =
+-        std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
+-    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
+-                "draft K cache", std::uint64_t{h.kv_row} * sizeof(__half),
++    const std::uint64_t draft_k = KvRowBytes(formats.draft.k, h.kv_row);
++    const std::uint64_t draft_v = KvRowBytes(formats.draft.v, h.kv_row);
++    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, h.mtp_position * draft_k,
++                "draft K cache", draft_k,
+                 true) ||
+-        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
+-                "draft V cache", std::uint64_t{h.kv_row} * sizeof(__half),
++        !region(mtp != nullptr ? mtp->v_cache : nullptr, h.mtp_position * draft_v,
++                "draft V cache", draft_v,
+                 true) ||
+         !region(
+             mtp != nullptr ? mtp->h : nullptr,
+@@ -5294,6 +5340,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
+   if (trace && !copy_trace(s_.mtp_res + final_row, trace->fused))
+     return false;
+   Session::AttentionState attn;
++  attn.formats = FlashKvFormats().draft;
+   attn.rope = session.vision_input_.rope();
+   attn.k_cache = session.mtp_.k_cache;
+   attn.v_cache = session.mtp_.v_cache;
+@@ -5331,13 +5378,18 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
+     kv.rows = 2 * c.AttentionKvDim();
+     if (!DenseBatch(kv, s_.mixed, s_.qg, n, error_msg) ||
+         !PrepareAttention(s_.qg, kv.rows, nullptr, l.attn_k_norm.f32(), nullptr,
+-                          nullptr, attn.k_cache, attn.v_cache, n, 0,
++                          nullptr, attn.formats.k == KvType::F16 ? attn.k_cache : key_stage_,
++                          attn.formats.v == KvType::F16 ? attn.v_cache : value_stage_, n, 0,
+                           c.num_kv_heads, c.head_dim, c.rotary_dim,
+                           &session.control_->mtp_position, c.rope_theta,
+                           c.rms_eps, stream_, attn.rope, false, yarn_)) {
+       AssignError(error_msg, "MTP cache projection failed");
+       return false;
+     }
++    PackCache(key_stage_, attn.k_cache, attn.formats.k, c.AttentionKvDim(), n,
++              &session.control_->mtp_position, stream_);
++    PackCache(value_stage_, attn.v_cache, attn.formats.v, c.AttentionKvDim(), n,
++              &session.control_->mtp_position, stream_);
+     const auto capacity =
+         IndexerCapacity(c, options_.max_batch, session.max_context_);
+     if (!DenseBatch(l.indexer_k, s_.mixed, s_.ik, n, error_msg))
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/executor.hpp b/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+index 67efcd1..d885a0d 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/executor.hpp
+@@ -1,6 +1,8 @@
+ #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+ #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+ 
++#include "src/models/qwen38_flash_next/kv_format.hpp"
++
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_runtime.h>
+ #include <hipblas/hipblas.h>
+@@ -154,6 +156,7 @@ private:
+     RollbackRows state_snapshots;  ///< [max_spec-1][v_heads][d][d]
+   };
+   struct AttentionState {
++    KvPair formats{FlashKvFormats().target};
+     const qwen::vision::DeviceRope* rope{nullptr};
+     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
+     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+@@ -262,7 +265,7 @@ public:
+   /// written them, for a session whose factor is not 1. `pooled` selects the
+   /// indexer block layout; `destination` holds only the requested rows.
+   void CopyNativeKeys(const Session& s, const __half* rows, std::uint32_t first,
+-                      std::uint32_t count, bool pooled,
++                      std::uint32_t count, bool pooled, KvType format,
+                       const qwen::vision::DeviceRope* rope, __half* destination,
+                       hipStream_t stream) const;
+ 
+@@ -742,6 +745,10 @@ private:
+   std::unique_ptr<BlasLt> blaslt_;
+ 
+   // Scratch, sized for max_batch tokens. Names follow reference.cpp.
++  // Packed projections use one shared FP16 write/prefill view per side.
++  // Stream ordering protects it across layers, sessions and the MTP head.
++  __half* key_stage_{nullptr};
++  __half* value_stage_{nullptr};
+   struct Scratch {
+     std::int32_t* tokens;
+     void* x_half;   ///< activations narrowed to the weight's 16-bit type
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp b/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+index 45279ab..eca0614 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp
+@@ -17,6 +17,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
+ namespace {
+ 
+ constexpr unsigned kThreads = 256;
++#include "src/models/qwen38_flash_next/kernels/rocm/kv_codec.hpp"
+ 
+ __device__ __forceinline__ float SigmoidF(float x) {
+   return 1.0f / (1.0f + __expf(-x));
+@@ -3197,7 +3198,7 @@ __global__ void AttentionKernel(
+     float* partials, const std::uint32_t* start_pos, std::uint32_t heads,
+     std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+     const std::uint32_t* lists, const std::uint32_t* counts,
+-    std::uint32_t capacity, std::uint32_t dense_extent) {
++    std::uint32_t capacity, std::uint32_t dense_extent, KvPair formats) {
+   constexpr std::uint32_t kTile = 256;
+   constexpr std::uint32_t kWindow = 1024;  // blocks compacted per pass
+   const std::uint32_t split = blockIdx.z;
+@@ -3246,8 +3247,7 @@ __global__ void AttentionKernel(
+   // context row (eight dims per lane); the partials are summed at the end.
+   float acc[kGroup][8] = {};
+   const std::size_t kv_stride = static_cast<std::size_t>(kv_heads) * d;
+-  const __half* k_head = k_cache + kvh * d;
+-  const __half* v_head = v_cache + kvh * d;
++
+ 
+   // Rows are read eight contiguous halves per lane, one 16-byte load, so a
+   // wave reads a whole 256-wide row at once. A wave issues the rows of
+@@ -3256,7 +3256,7 @@ __global__ void AttentionKernel(
+   // the last key's row and are never used; a batch with no key at all is
+   // skipped (returns false).
+   constexpr std::uint32_t kBatch = 8;
+-  const auto load_batch = [&](const __half* head, std::uint32_t base,
++  const auto load_batch = [&](const __half* head, KvType type, std::uint32_t base,
+                               uint4* rows) {
+     bool any = false;
+ #pragma unroll
+@@ -3269,8 +3269,7 @@ __global__ void AttentionKernel(
+ #pragma unroll
+     for (std::uint32_t b = 0; b < kBatch; ++b) {
+       const std::uint32_t j = min(keys[base + b], n_kv - 1);
+-      rows[b] = *reinterpret_cast<const uint4*>(
+-          head + (static_cast<std::size_t>(j) * kv_stride) + (lane * 8));
++      rows[b] = LoadCacheEight(head, static_cast<std::size_t>(j) * kv_stride + kvh * d + lane * 8, type);
+     }
+     return true;
+   };
+@@ -3356,7 +3355,7 @@ __global__ void AttentionKernel(
+       s_mine[g] = -INFINITY;
+     for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+       uint4 rows[kBatch];
+-      if (!load_batch(k_head, (wave * 32) + k0, rows)) {
++      if (!load_batch(k_cache, formats.k, (wave * 32) + k0, rows)) {
+         continue;
+       }
+ #pragma unroll
+@@ -3412,7 +3411,7 @@ __global__ void AttentionKernel(
+     __syncthreads();
+     for (std::uint32_t k0 = 0; k0 < 32; k0 += kBatch) {
+       uint4 rows[kBatch];
+-      if (!load_batch(v_head, (wave * 32) + k0, rows)) {
++      if (!load_batch(v_cache, formats.v, (wave * 32) + k0, rows)) {
+         continue;
+       }
+ #pragma unroll
+@@ -8985,13 +8984,32 @@ void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
+                      budget, mask_words, max_blocks);
+ }
+ 
++void PackCache(const __half* dense, __half* packed, KvType type, unsigned width,
++               unsigned rows, const unsigned* position, hipStream_t stream) {
++  if (type == KvType::F16 || !rows) return;
++  const dim3 grid((size_t(width) * rows + 255) / 256);
++  if (type == KvType::Q8_0)
++    hipLaunchKernelGGL(PackCacheRows<KvType::Q8_0>, grid, dim3(256), 0, stream,
++                       dense, packed, width, rows, position);
++  else
++    hipLaunchKernelGGL(PackCacheRows<KvType::Q4_0>, grid, dim3(256), 0, stream,
++                       dense, packed, width, rows, position);
++}
++
++void ExpandCache(const __half* packed, __half* dense, KvType type, unsigned width,
++                 unsigned rows, const unsigned* position, hipStream_t stream) {
++  if (type == KvType::F16 || !rows) return;
++  hipLaunchKernelGGL(ExpandCachePrefix, dim3(512), dim3(256), 0, stream,
++                     packed, dense, type, width, rows, position);
++}
++
+ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
+                float* partials, std::uint32_t splits, std::uint32_t n_tokens,
+                const std::uint32_t* start_pos, std::uint32_t heads,
+                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+                hipStream_t stream, std::uint32_t* lists, std::uint32_t* counts,
+-               std::uint32_t list_capacity, std::uint32_t dense_extent) {
++               std::uint32_t list_capacity, std::uint32_t dense_extent, KvPair formats) {
+   if (d != 256) {
+     return;  // the kernel is written for the model's 256-wide heads
+   }
+@@ -9019,7 +9037,7 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+     hipLaunchKernelGGL(kernel, dim3(heads / group, n_tokens, z), dim3(kThreads),
+                        0, stream, q, k_cache, v_cache, mask, mask_words, out,
+                        partials, start_pos, heads, kv_heads, d, ratio, lists,
+-                       counts, list_capacity, dense_extent);
++                       counts, list_capacity, dense_extent, formats);
+   };
+   if (n_tokens <= 2) {
+     launch(AttentionKernel<2>, 2);
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp b/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+index d0d96b1..05a58b6 100644
+--- a/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
++++ b/src/models/qwen38_flash_next/kernels/rocm/kernels.hpp
+@@ -1,6 +1,8 @@
+ #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
+ #define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_
+ 
++#include "src/models/qwen38_flash_next/kv_format.hpp"
++
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_runtime.h>
+ 
+@@ -508,6 +510,11 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
+ 
+ /// Stores f32 rows into the f16 cache at positions start_pos + t:
+ /// cache[(start_pos + t)][row_dim].
++void PackCache(const __half* dense, __half* packed, KvType type, unsigned width,
++               unsigned rows, const unsigned* position, hipStream_t stream);
++void ExpandCache(const __half* packed, __half* dense, KvType type, unsigned width,
++                 unsigned rows, const unsigned* position, hipStream_t stream);
++
+ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
+              std::uint32_t row_dim, const std::uint32_t* start_pos,
+              hipStream_t stream);
+@@ -580,7 +587,7 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
+                std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+                hipStream_t stream, std::uint32_t* lists = nullptr,
+                std::uint32_t* counts = nullptr, std::uint32_t list_capacity = 0,
+-               std::uint32_t dense_extent = 0);
++               std::uint32_t dense_extent = 0, KvPair formats = {KvType::F16, KvType::F16});
+ 
+ /// Maximum visible sparse context for this WMMA geometry, or zero when the
+ /// geometry is unsupported. Checkpoint planning uses the same dispatch limit.
+diff --git a/src/models/qwen38_flash_next/kernels/rocm/kv_codec.hpp b/src/models/qwen38_flash_next/kernels/rocm/kv_codec.hpp
+new file mode 100644
+index 0000000..6a7f53c
+--- /dev/null
++++ b/src/models/qwen38_flash_next/kernels/rocm/kv_codec.hpp
+@@ -0,0 +1,68 @@
++// Device storage uses the GGML Q8_0 and Q4_0 block layouts.
++template <KvType kind>
++__global__ void PackCacheRows(const __half* source, void* output,
++                              unsigned width, unsigned rows, const unsigned* pos) {
++  constexpr unsigned bytes = kind == KvType::Q8_0 ? 34 : 18;
++  const unsigned local = blockIdx.x * blockDim.x + threadIdx.x;
++  const unsigned lane = threadIdx.x & 31;
++  if (local >= width * rows) return;
++  const size_t i = size_t(pos ? *pos : 0) * width + local;
++  const float x = __half2float(source[i]);
++  float amax = fabsf(x);
++  for (int dist = 16; dist; dist >>= 1)
++    amax = fmaxf(amax, __shfl_xor(amax, dist, 32));
++  float scale;
++  if constexpr (kind == KvType::Q8_0) {
++    // Match the reference FP32 scale and reciprocal even with HIP fast-math.
++    scale = __fdiv_rn(amax, 127.0f);
++    asm volatile("" : "+v"(scale));
++  } else {
++    unsigned first = fabsf(x) == amax ? lane : 32;
++    for (int dist = 16; dist; dist >>= 1)
++      first = min(first, __shfl_xor(first, dist, 32));
++    scale = __shfl(x, first, 32) / -8.0f;
++  }
++  auto* block = static_cast<unsigned char*>(output) + (i / 32) * bytes;
++  if (lane == 0) *reinterpret_cast<__half*>(block) = __float2half(scale);
++  float inverse = scale != 0.0f ? __fdiv_rn(1.0f, scale) : 0.0f;
++  asm volatile("" : "+v"(inverse));
++  const float scaled = __fmul_rn(x, inverse);
++  if constexpr (kind == KvType::Q8_0) {
++    // Products of a binary16 magnitude and these small integers are exact in
++    // FP32. Compare the midpoint explicitly, including ties away from zero.
++    const int lower = min(127, static_cast<int>(fabsf(scaled)));
++    const int magnitude = amax == 0 ? 0 : min(127, lower + (fabsf(x) * 254.0f >= amax * (2 * lower + 1)));
++    reinterpret_cast<signed char*>(block + 2)[lane] =
++        static_cast<signed char>(x < 0 ? -magnitude : magnitude);
++  } else {
++    const unsigned code = static_cast<unsigned>(fmaxf(0, fminf(15, floorf(scaled + 8.5f))));
++    const unsigned high = __shfl_xor(code, 16, 32);
++    if (lane < 16) block[2 + lane] = static_cast<unsigned char>(code | (high << 4));
++  }
++}
++
++__device__ __forceinline__ uint4 LoadCacheEight(const __half* base, size_t i, KvType kind) {
++  if (kind == KvType::F16) return *reinterpret_cast<const uint4*>(base + i);
++  const bool q8 = kind == KvType::Q8_0;
++  const auto* block = reinterpret_cast<const unsigned char*>(base) + (i / 32) * (q8 ? 34 : 18);
++  const float scale = __half2float(*reinterpret_cast<const __half*>(block));
++  const unsigned offset = static_cast<unsigned>(i & 31);
++  uint4 result{};
++#pragma unroll
++  for (unsigned j = 0; j < 8; ++j) {
++    const unsigned lane = offset + j;
++    const int code = q8 ? int(reinterpret_cast<const signed char*>(block + 2)[lane])
++                        : int((block[2 + (lane & 15)] >> (lane >= 16 ? 4 : 0)) & 15) - 8;
++    reinterpret_cast<__half*>(&result)[j] = __float2half(scale * code);
++  }
++  return result;
++}
++
++__global__ void ExpandCachePrefix(const __half* packed, __half* output,
++                                  KvType kind, unsigned width, unsigned rows, const unsigned* pos) {
++  const size_t end = size_t((pos ? *pos : 0) + rows) * width / 8;
++  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < end;
++       i += size_t(gridDim.x) * blockDim.x) {
++    reinterpret_cast<uint4*>(output)[i] = LoadCacheEight(packed, i * 8, kind);
++  }
++}
+diff --git a/src/models/qwen38_flash_next/kv_format.hpp b/src/models/qwen38_flash_next/kv_format.hpp
+new file mode 100644
+index 0000000..571a600
+--- /dev/null
++++ b/src/models/qwen38_flash_next/kv_format.hpp
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++namespace gufo::models::qwen38_flash_next {
++enum class KvType : std::uint8_t { F16, Q8_0, Q4_0 };
++struct KvPair {
++  KvType k, v;
++};
++struct KvFormats {
++  KvPair target, draft;
++};
++
++inline const char* KvName(KvType kind) {
++  switch (kind) {
++    case KvType::Q8_0: return "q8_0";
++    case KvType::Q4_0: return "q4_0";
++    default: return "f16";
++  }
++}
++
++inline KvType ReadKvType(const char* key, KvType fallback) {
++  const char* value = std::getenv(key);
++  if (!value || !*value) return fallback;
++  for (const auto type : {KvType::F16, KvType::Q8_0, KvType::Q4_0}) {
++    if (std::string_view(value) == KvName(type)) return type;
++  }
++  throw std::invalid_argument(std::string(key) + " supports f16, q8_0 and q4_0");
++}
++
++inline const KvFormats& FlashKvFormats() {
++  static const KvFormats formats = [] {
++    KvPair target{ReadKvType("GUFO_FLASH_CACHE_K", KvType::F16),
++                  ReadKvType("GUFO_FLASH_CACHE_V", KvType::F16)};
++    return KvFormats{target, {ReadKvType("GUFO_FLASH_DRAFT_CACHE_K", target.k),
++                              ReadKvType("GUFO_FLASH_DRAFT_CACHE_V", target.v)}};
++  }();
++  return formats;
++}
++
++inline std::size_t KvRowBytes(KvType type, std::size_t width) {
++  if (type == KvType::F16) return width * 2;
++  if (width % 32 != 0) throw std::invalid_argument("Quantized KV requires 32-aligned rows");
++  return width / 32 * (type == KvType::Q8_0 ? 34 : 18);
++}
++
++inline unsigned KvFormatId(bool mtp) {
++  const auto& f = FlashKvFormats();
++  return unsigned(f.target.k) | (unsigned(f.target.v) << 2) |
++         (mtp ? (unsigned(f.draft.k) << 4) | (unsigned(f.draft.v) << 6) : 0);
++}
++} // namespace gufo::models::qwen38_flash_next

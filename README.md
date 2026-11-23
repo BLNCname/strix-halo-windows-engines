@@ -12,6 +12,14 @@ Three selectable ROCm profiles run the standard Unsloth Qwen3.8-Flash-Next GGUF 
 
 The loader dispatches by tensor type. Both mixed profiles retain 142 packed expert matrices and expand two Q2_0 matrices to Q8_0 exactly on upload. Dense Q6_K and the IQ4_XS token embedding expand to FP16. The IQ4_NL per-layer embedding stays host resident. The native context is 262144 tokens. The optional external Q8_0 MTP head is a separate GGUF. Obtain weights from [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF).
 
+### Attention cache in v1.1.0
+
+The target and MTP head store K and V in real GGML Q8_0, Q4_0 or FP16 rows. The manager defaults to Q8_0 for both. For direct Gufo invocation set `GUFO_FLASH_CACHE_K` and `GUFO_FLASH_CACHE_V` to `q8_0`, `q4_0` or `f16`. The draft inherits both values. Optional overrides are `GUFO_FLASH_DRAFT_CACHE_K` and `GUFO_FLASH_DRAFT_CACHE_V`. A direct invocation with no format settings retains FP16. The loader prints all four resolved formats.
+
+Each group of 32 values uses 34 bytes in Q8_0 or 18 bytes in Q4_0. The FP16 representation takes 64 bytes. Narrow attention reads packed rows directly. Wide prefill uses one FP16 work buffer per quantized side shared by all layers and sessions. Both saved continuation data and admission checks account for the selected row layout. Recurrent state and the sparse index use their model-specific types.
+
+On a 128 GiB Radeon 8060S system, a Q3 load at context 262144 with four sessions and a separate MTP head peaked at 122.33 GiB system commit with FP16 KV and 110.57 GiB with Q8_0 KV. Windows pagefile occupancy was about 1.3 GiB in both runs. For Q4 with the same window and four sessions, FP16 admission required four 7.01 GiB states with only 24.7 GiB available. Q8_0 loaded and served a real Hermes tool request.
+
 ## Build
 
 Prepare the Windows toolchain listed in [Gufo's build instructions](https://github.com/gufo-org/gufo/blob/v0.35.0/BUILD-WINDOWS.md), including the TheRock gfx1151 SDK, Rust 1.88, CMake, Ninja, vcpkg and the Visual Studio developer environment. In an x64 developer shell run the following command from a clean clone.
@@ -46,3 +54,5 @@ python package.py .build/build/gufo.exe .build/gufo dist/strix-halo-windows-gfx1
 ```
 
 The official release executable was built with TheRock 10.0.0, MSVC 14.44 headers and libraries, the Windows 10.0.26100 SDK, clang-cl/lld, Rust 1.88, ICU 79.1 and libjpeg-turbo 3.2.1. Alternative dependency toolchains can change which DLLs a local build needs. The manager's release dependency set matches the published executable.
+
+Run `python tests/kv_rows.py GUFO_RUNTIME GGML_REFERENCE .build/check/mixed-test.dll` for the KV codec comparison. It checks a nonzero row offset, untouched boundary rows, the packed codes, and expansion against ggml. Q8_0 picks the code farther from zero on exact mathematical midpoints. A float32 reciprocal in the CPU reference can choose the equally near code on the other side.
