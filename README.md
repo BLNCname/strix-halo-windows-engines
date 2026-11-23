@@ -20,7 +20,7 @@ Prepare the Windows toolchain listed in [Gufo's build instructions](https://gith
 python build.py .build
 ```
 
-The script fetches the pinned upstream commit, applies the mixed-format patch and builds the Flash-Next extension in Release mode with HIP device optimization. The output is `.build/build/gufo.exe`. For a prepared SDK environment, additional CMake configuration arguments after the work directory replace the default preset.
+The script fetches the pinned upstream commit, applies the mixed-format patch and builds the Flash-Next extension in Release mode with HIP device optimization. The output is `.build/build/gufo.exe`. Use `python build.py .build --jobs 8` to set parallelism. For a prepared SDK environment, CMake arguments following a separate `--` replace the default preset.
 
 ## Install
 

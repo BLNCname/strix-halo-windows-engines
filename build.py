@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parent
 UPSTREAM = "https://github.com/gufo-org/gufo.git"
@@ -49,6 +50,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("work", type=Path)
     parser.add_argument("--jobs", type=int, default=12)
-    parser.add_argument("cmake_args", nargs=argparse.REMAINDER, help="optional alternate CMake configuration arguments after --")
-    args = parser.parse_args()
-    build(args.work, args.cmake_args, args.jobs)
+    options = sys.argv[1:]
+    split = options.index("--") if "--" in options else len(options)
+    args = parser.parse_args(options[:split])
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    build(args.work, options[split + 1:], args.jobs)
