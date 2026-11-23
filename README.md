@@ -26,4 +26,15 @@ The script fetches the pinned upstream commit, applies the mixed-format patch an
 
 The [runtime manager](https://github.com/BLNCname/strix-halo-runtime-manager) installs the release bundle by URL and fetches the matching runtime dependencies from their publishers. The engine package contains the native executable, profile manifest and license notices. Model shards stay where you downloaded them.
 
-The project additions and Gufo are MIT licensed. Gufo's upstream notices cover its incorporated components. Full third-party texts accompany the release.
+The project additions and Gufo are MIT licensed. Gufo's notices cover its incorporated components, including ggml (MIT) and Rust crates. Its unmodified Symphonia crates use MPL-2.0. Their exact versions and checksums are recorded in [the upstream Cargo.lock](https://github.com/gufo-org/gufo/blob/v0.35.0/Cargo.lock), and sources are available from [crates.io](https://crates.io/crates/symphonia). Full third-party texts accompany the release. Peonist publishes the HaloGen container under its [own EULA](https://github.com/peonist-ai/halogen-flash-server/blob/main/LICENSE.md). This build contains no HaloGen executable or source.
+
+## Check the kernels and package
+
+In the prepared Windows developer environment, run `tests/build-test-dll.ps1 -Work .build -Destination .build/check`. This links the actual release kernel libraries to test exports. Run the following command for the first Q3 or IQ4 shard with NumPy installed. The CPU reference directory must contain an independently built ggml-base.dll exporting the relevant dequantizers, including dequantize_row_q2_0.
+
+```powershell
+python tests/mixed_rows.py FIRST_SHARD .build/check/mixed-test.dll GUFO_RUNTIME GGML_REFERENCE .build/gufo
+python package.py .build/build/gufo.exe .build/gufo dist/strix-halo-windows-gfx1151.zip
+```
+
+The official release executable was built with TheRock 10.0.0, MSVC 14.44 headers and libraries, the Windows 10.0.26100 SDK, clang-cl/lld, Rust 1.88, ICU 79.1 and libjpeg-turbo 3.2.1. Alternative dependency toolchains can change which DLLs a local build needs. The manager's release dependency set matches the published executable.
